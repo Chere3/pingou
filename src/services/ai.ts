@@ -245,18 +245,32 @@ FORMATO: solo las queries en inglés, una por línea, sin numeración, sin texto
 		}
 
 		try {
-			// Cuando hay contexto web lo inyectamos como un turno previo para que
-			// el modelo lo trate como conocimiento recuperado y no como input del usuario.
+			// Cuando hay contexto web lo inyectamos como un turno previo y le
+			// agregamos un "writer prompt" estilo Perplexica que obliga al modelo
+			// a citar con [N] inline y a ser explícito cuando las fuentes no
+			// alcanzan. Las fuentes vienen ya numeradas desde webResearch.ts
+			// como "Fuente 1: URL ...", así que el modelo solo tiene que usar
+			// el mismo número entre corchetes.
 			const contextMessages: OpenAI.ChatCompletionMessageParam[] = webContext
 				? [
 						{
 							role: "user" as const,
-							content: `Usa el siguiente contexto de internet para responder con mayor precisión:\n\n${webContext}`,
+							content: `${webContext}
+
+Usá el contexto de arriba para responder con mayor precisión. Reglas:
+
+1. CITAS INLINE: cuando uses información de una fuente, cita con [N] al final de la oración (donde N es el número de la fuente). Una afirmación puede tener varias citas: [1][2]. Si combinás info de varias fuentes en un mismo punto, citá todas.
+
+2. SIN FUENTE = DECILO: si una afirmación no está respaldada por las fuentes, marcala con "(según mi conocimiento general)" en vez de presentarla como hecho recuperado.
+
+3. OPINIÓN CONCRETA: no te quedes en generalidades. Si las fuentes permiten una recomendación o conclusión específica, dala. Mejor una respuesta opinada y útil que un resumen vago.
+
+4. CONTRADICCIONES: si las fuentes se contradicen, mencionalo explícitamente en lugar de elegir una al azar.`,
 						},
 						{
 							role: "assistant" as const,
 							content:
-								"Entendido. Tomaré en cuenta esa información para dar una respuesta más precisa.",
+								"Entendido. Voy a citar con [N] inline cada vez que use una fuente, marcar lo no respaldado, ser específico, y señalar contradicciones si las hay.",
 						},
 					]
 				: [];
