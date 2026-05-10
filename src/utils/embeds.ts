@@ -46,14 +46,22 @@ export const Embeds = {
 			});
 	},
 
-	aiReplyEmbeds(reply: string, usage?: CompletionUsage): Embed[] {
+	aiReplyEmbeds(
+		reply: string,
+		usage?: CompletionUsage,
+		sourceUrl?: string,
+	): Embed[] {
 		const chunks = this.chunkText(reply, 4000);
 		const input = usage?.prompt_tokens ?? 0;
 		const output = (usage?.total_tokens ?? 0) - input;
 
-		const footerText = usage
+		let footerText = usage
 			? `Respuesta IA | I: ${input} | O: ${output}`
 			: "Respuesta IA";
+
+		if (sourceUrl) {
+			footerText += ` | 🔍 ${sourceUrl}`;
+		}
 
 		return chunks.map((chunk, i) => {
 			const embed = new Embed().setDescription(chunk).setColor("Blue");

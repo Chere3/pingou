@@ -1,10 +1,11 @@
-import { ActionRow, Button, createEvent } from "seyfert";
+import { ActionRow, Button, createEvent, Embed } from "seyfert";
 import { ButtonStyle } from "seyfert/lib/types";
 import { CONFIG } from "@/config";
 import { pendingRepRepository } from "@/repositories/pendingRepRepository";
 import { aiService } from "@/services/ai";
 import { bumpService } from "@/services/bumpService";
 import { cooldownService } from "@/services/cooldown";
+import { webResearchService } from "@/services/webResearch";
 import { Embeds } from "@/utils/embeds";
 
 function normalizeText(text: string): string {
@@ -75,55 +76,97 @@ export default createEvent({
 				});
 			}
 
+			// Extraemos el contenido limpio quitando el mention al bot
 			const cleanContent = (message.content ?? "")
 				.replaceAll(new RegExp(`<@!?${client.me.id}>`, "g"), "")
 				.trim();
 
-			let promptMessages: string[] = [];
+			let contextLimit = 2;
+			const match = /contexto:\s*(\d+)/i.exec(cleanContent);
+			if (match?.[1]) {
+				contextLimit = Math.min(Number.parseInt(match[1], 10), 10);
+			}
+
+			// Solo investigamos si la pregunta es "BUENA" y tiene señales de que
+			// necesita info externa (tecnologías, errores, versiones, etc.)
+			const isGoodQuestion = aiService.classify(cleanContent) === "BUENA";
+			const needsResearch =
+				isGoodQuestion && webResearchService.shouldResearch(cleanContent);
+
+			// Enviamos el estado de investigación de inmediato para que el usuario
+			// sepa que estamos trabajando en ello. Lo editaremos con la respuesta final.
+			const statusMsg = needsResearch
+				? await message.reply({
+						embeds: [
+							new Embed()
+								.setDescription("🔍 Investigando en internet...")
+								.setColor("Yellow"),
+						],
+					})
+				: null;
+
+			let promptMessages: string[];
 
 			if (cleanContent.length > 0) {
 				promptMessages = [`${message.author.username}: ${cleanContent}`];
 			} else {
-				let contextLimit = 2;
-				const content = message.content ?? "";
-				const match = /contexto:\s*(\d+)/i.exec(content);
-				if (match?.[1]) {
-					contextLimit = Math.min(Number.parseInt(match[1], 10), 10);
-				}
-
 				const prevMessages = await aiService.getLatestMessages(
 					client,
 					message.channelId,
 					contextLimit + 1,
 					message.author.id,
 				);
-
 				if (!prevMessages) return;
-
 				promptMessages = [...prevMessages]
 					.reverse()
 					.map((m) => `${m.author.username}: ${m.content ?? ""}`);
 			}
 
 			try {
-				const { text, usage } = await aiService.chat(promptMessages);
+				// Run web research and message preparation concurrently so the
+				// fetch latency doesn't block building the prompt context.
+				const [webResult] = await Promise.all([
+					needsResearch ? webResearchService.research(cleanContent) : null,
+				]);
+
+				const { text, usage } = await aiService.chat(
+					promptMessages,
+					webResult?.contextForAI,
+				);
 
 				await cooldownService.setCooldown(userId, cooldownKey, 15);
 
-				const embeds = Embeds.aiReplyEmbeds(text, usage);
-				for (const embed of embeds) {
-					await message.reply({ embeds: [embed] });
+				const embeds = Embeds.aiReplyEmbeds(text, usage, webResult?.sourceUrl);
+
+				if (statusMsg) {
+					// Replace the "Investigando…" status with the first AI embed.
+					await client.messages.edit(statusMsg.id, statusMsg.channelId, {
+						embeds: [embeds[0]],
+					});
+					// Any overflow chunks (very long responses) go as separate replies.
+					for (const embed of embeds.slice(1)) {
+						await message.reply({ embeds: [embed] });
+					}
+				} else {
+					for (const embed of embeds) {
+						await message.reply({ embeds: [embed] });
+					}
 				}
 			} catch (error) {
 				console.error("Error in AI mention reply:", error);
-				await message.reply({
-					embeds: [
-						Embeds.errorEmbed(
-							"Error de IA",
-							"Ocurrió un error al procesar tu pregunta. Por favor, intentá más tarde.",
-						),
-					],
-				});
+				const errorEmbed = Embeds.errorEmbed(
+					"Error de IA",
+					"Ocurrió un error al procesar tu pregunta. Por favor, intentá más tarde.",
+				);
+				if (statusMsg) {
+					await client.messages
+						.edit(statusMsg.id, statusMsg.channelId, {
+							embeds: [errorEmbed],
+						})
+						.catch(() => message.reply({ embeds: [errorEmbed] }));
+				} else {
+					await message.reply({ embeds: [errorEmbed] });
+				}
 			}
 			return;
 		}

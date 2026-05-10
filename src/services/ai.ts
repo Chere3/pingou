@@ -141,12 +141,29 @@ export class AIService {
 
 	async chat(
 		messages: string[],
+		webContext?: string,
 	): Promise<{ text: string; usage?: OpenAI.CompletionUsage }> {
 		if (!process.env.AI_API_KEY) {
 			throw new Error("Missing AI_API_KEY env variable");
 		}
 
 		try {
+			// Cuando hay contexto web lo inyectamos como un turno previo para que
+			// el modelo lo trate como conocimiento recuperado y no como input del usuario.
+			const contextMessages: OpenAI.ChatCompletionMessageParam[] = webContext
+				? [
+						{
+							role: "user" as const,
+							content: `Usa el siguiente contexto de internet para responder con mayor precisión:\n\n${webContext}`,
+						},
+						{
+							role: "assistant" as const,
+							content:
+								"Entendido. Tomaré en cuenta esa información para dar una respuesta más precisa.",
+						},
+					]
+				: [];
+
 			const result = await this.ai.chat.completions.create({
 				model: this.model,
 				max_tokens: 800,
@@ -157,6 +174,7 @@ export class AIService {
 						role: "system",
 						content: BOT_PROMPT,
 					},
+					...contextMessages,
 					...messages.map((m) => ({ role: "user" as const, content: m })),
 				],
 			});
@@ -165,7 +183,7 @@ export class AIService {
 				text:
 					result.choices[0]?.message?.content ||
 					"Ahora no puedo responder a esta pregunta.",
-				usage: result.usage,
+				usage: result.usage ?? undefined,
 			};
 		} catch (error: any) {
 			console.error("OpenAI API error:", error);
