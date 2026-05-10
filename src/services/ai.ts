@@ -317,6 +317,57 @@ ${contentSummary}${previousQueriesBlock}
 	}
 
 	/**
+	 * Extractor estilo Perplexica scrapeURL.ts: dado un fragmento de markdown
+	 * scrapeado y la pregunta original, devuelve bullets en formato
+	 * telegram-style con los hechos relevantes. Preserva números y nombres
+	 * exactos, descarta marketing/nav/footer. Si el chunk no tiene info
+	 * relevante devuelve "".
+	 *
+	 * Falla silenciosamente devolviendo un slice del chunk como fallback —
+	 * peor que perfecto pero mejor que perder la fuente entera.
+	 */
+	async extractRelevantFacts(query: string, chunk: string): Promise<string> {
+		if (!process.env.AI_API_KEY) return chunk.slice(0, 800);
+		try {
+			const result = await this.ai.chat.completions.create({
+				model: this.model,
+				max_tokens: 400,
+				temperature: 0,
+				response_format: { type: "json_object" },
+				messages: [
+					{
+						role: "system",
+						content: `Extraés hechos relevantes a una pregunta desde un fragmento de markdown scrapeado de la web.
+
+Responde con JSON: { "facts": string }
+
+Reglas:
+- facts es texto con bullets ("- punto" por línea). Telegram-style, breve.
+- Preservá números, versiones, nombres propios EXACTOS de la fuente.
+- NO inventes. Si el fragmento no tiene nada relevante a la pregunta, devolvé { "facts": "" }.
+- Descartá navegación, headers, footers, banners de cookies, ads, "subscribe", "related posts".
+- Si hay código relevante, incluilo entre backticks.
+
+Ejemplo:
+Pregunta: "qué es bun"
+Fragmento: "...Bun is a fast all-in-one JavaScript runtime... Released in 2022 by Jarred Sumner... Built on JavaScriptCore..."
+{ "facts": "- Runtime all-in-one para JavaScript\\n- Released 2022 por Jarred Sumner\\n- Built on JavaScriptCore" }`,
+					},
+					{
+						role: "user",
+						content: `Pregunta: "${query.slice(0, 200)}"\n\nFragmento:\n${chunk}`,
+					},
+				],
+			});
+			const raw = result.choices[0]?.message?.content ?? "";
+			const parsed = this.parseLooseJson<{ facts?: string }>(raw);
+			return parsed?.facts ?? chunk.slice(0, 800);
+		} catch {
+			return chunk.slice(0, 800);
+		}
+	}
+
+	/**
 	 * Picker estilo Perplexica baseSearch.ts pickerPrompt: dado una pregunta
 	 * y una lista numerada de URLs candidatas, devuelve el índice de la URL
 	 * con mejor combinación de relevancia + reputación de dominio + diversidad

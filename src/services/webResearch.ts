@@ -10,7 +10,16 @@ class WebResearchService {
 	private readonly JINA_BASE = "https://r.jina.ai/";
 	private readonly FETCH_TIMEOUT_MS = 8_000;
 	private readonly MAX_QUERIES = 5;
-	private readonly MAX_CONTENT_CHARS = 1_500;
+	// Cuánto markdown bruto traer por URL desde Jina Reader. El extractor
+	// por chunks se encarga de filtrar después.
+	private readonly FETCH_MAX_CHARS = 12_000;
+	// Chunks pasados al extractor LLM por fuente.
+	private readonly CHUNK_SIZE = 4_000;
+	private readonly CHUNK_OVERLAP = 500;
+	// Cap de chunks procesados por fuente para acotar latencia (paralelo).
+	private readonly MAX_CHUNKS_PER_SOURCE = 3;
+	// Para fuentes cortas no vale la pena el round trip del extractor.
+	private readonly EXTRACTOR_MIN_CHARS = 2_000;
 
 	private async fetchWithTimeout(
 		url: string,
@@ -87,6 +96,61 @@ class WebResearchService {
 	}
 
 	/**
+	 * Splitter char-based con overlap. No corta en límites de palabra (los
+	 * chunks pueden empezar/terminar mid-token) — el extractor LLM tolera
+	 * eso fácilmente. El overlap previene perder info que esté en el límite.
+	 */
+	private splitText(
+		text: string,
+		chunkSize: number,
+		overlap: number,
+	): string[] {
+		if (text.length <= chunkSize) return [text];
+		const chunks: string[] = [];
+		const stride = chunkSize - overlap;
+		for (let i = 0; i < text.length; i += stride) {
+			chunks.push(text.slice(i, i + chunkSize));
+			if (i + chunkSize >= text.length) break;
+		}
+		return chunks;
+	}
+
+	/**
+	 * Extrae los hechos relevantes a `query` desde el markdown bruto de una
+	 * fuente. Para fuentes cortas (<EXTRACTOR_MIN_CHARS) devuelve el
+	 * contenido tal cual — no vale la pena el round trip del extractor.
+	 * Para fuentes largas, splittea en chunks (4000/500 overlap), corre el
+	 * extractor en paralelo sobre los primeros MAX_CHUNKS_PER_SOURCE chunks
+	 * y concatena los bullets.
+	 *
+	 * Si el extractor devuelve vacío para todos los chunks, fallback al
+	 * raw slice — preferimos contexto crudo sobre nada.
+	 */
+	private async extractFromSource(
+		query: string,
+		rawContent: string,
+	): Promise<string> {
+		if (rawContent.length < this.EXTRACTOR_MIN_CHARS) return rawContent;
+
+		const chunks = this.splitText(
+			rawContent,
+			this.CHUNK_SIZE,
+			this.CHUNK_OVERLAP,
+		).slice(0, this.MAX_CHUNKS_PER_SOURCE);
+
+		const extractions = await Promise.all(
+			chunks.map((chunk) => aiService.extractRelevantFacts(query, chunk)),
+		);
+
+		const combined = extractions
+			.map((e) => e.trim())
+			.filter((e) => e.length > 0)
+			.join("\n");
+
+		return combined || rawContent.slice(0, 1_500);
+	}
+
+	/**
 	 * Loop adaptativo de investigación web. Recibe las queries iniciales
 	 * (ya generadas por el modelo, típicamente vía aiService.generateSearchQueries)
 	 * y evalúa tras cada ronda si necesita buscar más (0-N adicionales).
@@ -128,13 +192,19 @@ class WebResearchService {
 
 			if (newUrl) {
 				seenUrls.add(newUrl);
-				const content = await this.fetchMarkdown(
+				const rawContent = await this.fetchMarkdown(
 					newUrl,
-					this.MAX_CONTENT_CHARS,
+					this.FETCH_MAX_CHARS,
 				);
-				if (content?.trim()) {
-					sources.push({ url: newUrl, content });
-					await onProgress?.(`✅ Fuente ${sources.length} obtenida.`);
+				if (rawContent?.trim()) {
+					await onProgress?.(
+						`📝 Extrayendo info relevante de fuente ${sources.length + 1}...`,
+					);
+					const content = await this.extractFromSource(query, rawContent);
+					if (content.trim()) {
+						sources.push({ url: newUrl, content });
+						await onProgress?.(`✅ Fuente ${sources.length} obtenida.`);
+					}
 				}
 			}
 
