@@ -199,15 +199,16 @@ export default createEvent({
 				webResult?.sourceUrls,
 			);
 
-			if (statusMsg) {
+			const [firstEmbed, ...restEmbeds] = embeds;
+			if (statusMsg && firstEmbed) {
 				await client.messages
 					.edit(statusMsg.id, statusMsg.channelId, {
-						embeds: [embeds[0] as APIEmbed],
+						embeds: [firstEmbed as APIEmbed],
 					})
 					.catch((err) =>
 						console.error("Error editing AI reply status embed:", err),
 					);
-				for (const embed of embeds.slice(1)) {
+				for (const embed of restEmbeds) {
 					await message
 						.reply({ embeds: [embed] })
 						.catch((err) =>
@@ -215,7 +216,7 @@ export default createEvent({
 						);
 				}
 			} else {
-				// Mención sin texto — usó contexto de mensajes previos
+				// Mención sin texto — o el statusMsg falló al crearse — replicamos todo
 				for (const embed of embeds) {
 					await message
 						.reply({ embeds: [embed] })

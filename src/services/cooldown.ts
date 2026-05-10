@@ -36,6 +36,12 @@ export class CooldownService {
 	 * Devuelve `{ ok: true }` si pudo reservar un slot, o
 	 * `{ ok: false, retryAfter }` con los segundos hasta que se libere
 	 * el slot más próximo.
+	 *
+	 * NOTA: hay una race condition acotada entre el read y el write — dos
+	 * requests concurrentes del mismo usuario podrían ambos reclamar el mismo
+	 * slot. En práctica el límite es bajo (Discord API + tiempo humano entre
+	 * mentions), pero si esto se vuelve crítico habría que mover a un upsert
+	 * atómico con check de conflicto.
 	 */
 	async claimRateLimitSlot(
 		userId: string,
@@ -43,16 +49,22 @@ export class CooldownService {
 		maxSlots: number,
 		windowSeconds: number,
 	): Promise<{ ok: true } | { ok: false; retryAfter: number }> {
-		let earliestExpiry = Number.POSITIVE_INFINITY;
-		for (let i = 0; i < maxSlots; i++) {
-			const slotKey = `${key}:${i}`;
-			const existing = await this.getCooldown(userId, slotKey);
-			if (!existing) {
-				await this.setCooldown(userId, slotKey, windowSeconds);
-				return { ok: true };
-			}
-			earliestExpiry = Math.min(earliestExpiry, existing.expiresAt.getTime());
+		// Lectura paralela de todos los slots — N round-trips bajan a 1
+		const slots = await Promise.all(
+			Array.from({ length: maxSlots }, (_, i) =>
+				this.getCooldown(userId, `${key}:${i}`),
+			),
+		);
+
+		const freeIndex = slots.findIndex((s) => !s);
+		if (freeIndex !== -1) {
+			await this.setCooldown(userId, `${key}:${freeIndex}`, windowSeconds);
+			return { ok: true };
 		}
+
+		const earliestExpiry = Math.min(
+			...slots.map((s) => s?.expiresAt.getTime() ?? Number.POSITIVE_INFINITY),
+		);
 		const retryAfter = Math.ceil((earliestExpiry - Date.now()) / 1000);
 		return { ok: false, retryAfter: Math.max(retryAfter, 1) };
 	}
