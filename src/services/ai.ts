@@ -161,13 +161,193 @@ export class AIService {
 	}
 
 	/**
-	 * Decide si la pregunta necesita investigación web y, de ser así, genera
-	 * 1-3 queries iniciales óptimas. Devuelve [] si el modelo considera que
-	 * no hace falta buscar (concepto básico, saludo, pregunta sin contexto
-	 * técnico específico, etc.). Falla silenciosamente devolviendo [query].
+	 * MEGA-CALL #1: decide si necesita investigación, genera queries, Y
+	 * provee una respuesta directa/fallback en una sola llamada.
 	 *
-	 * Usa JSON schema mode (`response_format: { type: "json_object" }`) para
-	 * parseo robusto en vez del split-by-newline regex previo.
+	 * - Si needsResearch=false: usar `answer` directamente, fin del flujo.
+	 * - Si needsResearch=true: lanzar investigación con `queries`. Si la
+	 *   investigación falla (rate limit, red, sin fuentes), usar `answer`
+	 *   como fallback en lugar de errorear al usuario.
+	 *
+	 * Total: 1 LLM call para casos sin research, primer call de 2 para
+	 * casos con research. Reemplaza al viejo generateSearchQueries +
+	 * fallback al BOT_PROMPT del chat.
+	 */
+	async planResponse(query: string): Promise<{
+		needsResearch: boolean;
+		queries: string[];
+		answer: string;
+	}> {
+		const fallback = (msg: string) => ({
+			needsResearch: false,
+			queries: [],
+			answer: msg,
+		});
+
+		if (!process.env.AI_API_KEY) {
+			return fallback("La IA no está configurada por el momento.");
+		}
+		const truncated = query.slice(0, 600);
+
+		try {
+			const result = await this.ai.chat.completions.create({
+				model: this.model,
+				max_tokens: 900,
+				temperature: 0.5,
+				response_format: { type: "json_object" },
+				messages: [
+					{
+						role: "system",
+						content: `${BOT_PROMPT}
+
+ADEMÁS, sos también el planificador del flujo agéntico de respuesta. Para CADA mensaje del usuario, decidís en una sola llamada:
+
+A) Si la pregunta NECESITA buscar en internet (needsResearch:true) → generás 2-3 queries en inglés.
+B) Si NO necesita búsqueda (needsResearch:false) → queries va vacío.
+
+En ambos casos, generás SIEMPRE un campo "answer" — la respuesta completa al usuario siguiendo las reglas de Pingou (versión simple primero, español amigable, etc.). En caso B la usás directamente. En caso A esta answer queda como fallback si la investigación falla o está bloqueada por rate limit; el flujo intentará primero hacer una respuesta mejor con fuentes web.
+
+needsResearch=true si la pregunta menciona:
+- Nombres propios (proyecto, librería, framework, comando, paquete npm/pip)
+- Mensajes de error específicos (TypeError, ImportError, stack traces)
+- Versiones / APIs / sintaxis específica
+- Cualquier "qué es <nombre>" con nombre propio
+REGLA CRÍTICA: si la pregunta tiene un nombre propio NO asumas que sabes qué es. SIEMPRE investigá.
+
+needsResearch=false SOLO si: saludos/charla, conceptos genéricos sin nombres propios ("qué es una variable", "qué es un bucle"), opiniones sin tema concreto.
+
+FORMATO de respuesta (JSON estricto):
+{
+  "needsResearch": boolean,
+  "queries": string[],     // queries en inglés si needsResearch=true, [] si no
+  "answer": string         // respuesta o fallback, en español, siguiendo BOT_PROMPT
+}
+
+Ejemplos:
+- "hola" → { "needsResearch": false, "queries": [], "answer": "¡Hola! Soy Pingou, ¿en qué te puedo ayudar con programación?" }
+- "qué es bun" → { "needsResearch": true, "queries": ["bun javascript runtime", "bun.sh what is"], "answer": "Bun es un runtime alternativo a Node, pero dejame buscar info actualizada para darte detalles..." }
+- "qué es una variable" → { "needsResearch": false, "queries": [], "answer": "Una variable es un espacio en memoria con un nombre, donde guardás un valor que puede cambiar. Ej: \`let x = 5\`. ¿Querés que profundice?" }`,
+					},
+					{
+						role: "user",
+						content: truncated,
+					},
+				],
+			});
+			const raw = result.choices[0]?.message?.content ?? "";
+			const parsed = this.parseLooseJson<{
+				needsResearch?: boolean;
+				queries?: unknown;
+				answer?: string;
+			}>(raw);
+
+			if (!parsed) {
+				return fallback("Ahora no puedo responder a esta pregunta.");
+			}
+
+			const queries = Array.isArray(parsed.queries)
+				? parsed.queries
+						.filter(
+							(q): q is string => typeof q === "string" && q.trim().length > 3,
+						)
+						.map((q) => q.trim())
+						.slice(0, 3)
+				: [];
+
+			return {
+				needsResearch: !!parsed.needsResearch && queries.length > 0,
+				queries,
+				answer:
+					typeof parsed.answer === "string" && parsed.answer.trim().length > 0
+						? parsed.answer.trim()
+						: "Ahora no puedo responder a esta pregunta.",
+			};
+		} catch (err) {
+			console.error("planResponse error:", err);
+			return fallback("Ocurrió un error al procesar tu pregunta.");
+		}
+	}
+
+	/**
+	 * MEGA-CALL #2: dado una pregunta y las fuentes scrapeadas en crudo
+	 * (markdown), produce el answer final con citas [N] inline. El modelo
+	 * hace internamente la filtración de noise (nav/ads/footers), el match
+	 * de info relevante y la síntesis.
+	 *
+	 * Reemplaza al pipeline extractor-por-fuente + chat. Una sola llamada
+	 * en lugar de N (extract) + 1 (chat).
+	 *
+	 * Las fuentes vienen numeradas — el modelo usa esos mismos números
+	 * como citas inline. Si una afirmación no tiene respaldo en ninguna
+	 * fuente debe marcarla con "(según mi conocimiento general)".
+	 */
+	async synthesizeAnswer(
+		query: string,
+		sources: { url: string; content: string }[],
+	): Promise<{ text: string; usage?: OpenAI.CompletionUsage }> {
+		if (!process.env.AI_API_KEY) {
+			throw new Error("Missing AI_API_KEY env variable");
+		}
+
+		const sourcesBlock = sources
+			.map(
+				(s, i) =>
+					`--- Fuente ${i + 1}: ${s.url} ---\n${s.content.slice(0, 8_000)}`,
+			)
+			.join("\n\n");
+
+		try {
+			const result = await this.ai.chat.completions.create({
+				model: this.model,
+				max_tokens: 800,
+				temperature: 0.68,
+				top_p: 0.77,
+				messages: [
+					{
+						role: "system",
+						content: `${BOT_PROMPT}
+
+ADEMÁS, recibís en el siguiente turno fuentes de internet numeradas (markdown crudo scrapeado). Reglas extra para esta respuesta:
+
+1. CITAS INLINE: cada afirmación que tomes de una fuente la citás con [N] al final de la oración. [1][2] cuando combinás varias.
+2. SIN FUENTE = DECILO: si una afirmación no está respaldada por las fuentes, marcala con "(según mi conocimiento general)" en lugar de presentarla como hecho.
+3. OPINIÓN CONCRETA: si las fuentes permiten una recomendación específica, dala. Mejor opinada y útil que vaga.
+4. CONTRADICCIONES: si las fuentes se contradicen, decilo explícitamente.
+5. IGNORÁ NOISE: las fuentes incluyen nav, ads, "subscribe", footers, related posts. Extraé solo lo relevante a la pregunta y descartá el resto.
+
+Las reglas anteriores de Pingou (versión simple primero, español amigable, seguridad/moderación) siguen aplicando.`,
+					},
+					{
+						role: "user",
+						content: `Fuentes:\n\n${sourcesBlock}\n\n---\n\nPregunta: ${query}`,
+					},
+				],
+			});
+
+			return {
+				text:
+					result.choices[0]?.message?.content?.trim() ||
+					"Ahora no puedo responder a esta pregunta.",
+				usage: result.usage ?? undefined,
+			};
+		} catch (error) {
+			console.error("synthesizeAnswer error:", error);
+			const errorStr = JSON.stringify(error);
+			const isRateLimit =
+				(error as { status?: number })?.status === 429 ||
+				errorStr.includes("rate limit") ||
+				errorStr.includes("quota");
+			return {
+				text: isRateLimit
+					? "Estoy saturado por el momento (límite de uso alcanzado). Por favor, intentá de nuevo en unos minutos. 🔄"
+					: "Ocurrió un error al sintetizar la respuesta. Por favor, intentá más tarde.",
+			};
+		}
+	}
+
+	/**
+	 * @deprecated reemplazado por planResponse. Mantenido por si otros
+	 * call sites lo necesitan en el futuro; el mention IA ya no lo usa.
 	 */
 	async generateSearchQueries(query: string): Promise<string[]> {
 		if (!process.env.AI_API_KEY) return [query];

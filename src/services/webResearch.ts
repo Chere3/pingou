@@ -1,6 +1,7 @@
-import { aiService } from "@/services/ai";
-
 export interface ResearchResult {
+	/** Las fuentes con su markdown crudo, listas para synthesizeAnswer */
+	sources: { url: string; content: string }[];
+	/** Bloque pre-armado por compatibilidad con flujos legacy (chat con webContext) */
 	contextForAI: string;
 	sourceUrl: string;
 	sourceUrls?: string[];
@@ -9,14 +10,12 @@ export interface ResearchResult {
 class WebResearchService {
 	private readonly JINA_BASE = "https://r.jina.ai/";
 	private readonly FETCH_TIMEOUT_MS = 8_000;
-	// Cap total de queries en el loop adaptativo. Cada query = 1 fetch + 1 LLM
-	// call (extractor). El chat final agrega 1 call más.
-	private readonly MAX_QUERIES = 4;
-	// Cuánto markdown bruto traer por URL desde Jina Reader. El extractor
-	// recibe esto entero en una sola call para no explotar requests.
+	// Cap de fuentes finales que pasan al synthesize. El modelo recibe el
+	// markdown crudo y filtra noise en su única llamada.
+	private readonly MAX_SOURCES = 3;
+	// Cuánto markdown bruto traer por URL desde Jina Reader. El synthesize
+	// lo recibe entero — qwen3-coder-480b tiene context window amplísimo.
 	private readonly FETCH_MAX_CHARS = 8_000;
-	// Para fuentes cortas no vale la pena el round trip del extractor.
-	private readonly EXTRACTOR_MIN_CHARS = 1_500;
 
 	private async fetchWithTimeout(
 		url: string,
@@ -124,96 +123,63 @@ class WebResearchService {
 	}
 
 	/**
-	 * Extrae los hechos relevantes a `query` con UNA sola call al modelo
-	 * sobre el contenido entero (truncado a FETCH_MAX_CHARS). Reemplaza al
-	 * chunked extractor anterior (que hacía 3 calls paralelas por fuente)
-	 * para ahorrar requests. qwen3-coder-480b tiene context window enorme,
-	 * 8k chars cabe holgadamente.
+	 * Investigación web paralela y stateless. Toma las queries pre-generadas,
+	 * busca todas en paralelo en DDG Lite, junta los candidatos URL, rankea
+	 * por reputación de dominio, toma los top MAX_SOURCES (deduplicados) y
+	 * fetchea su markdown en paralelo. Devuelve las fuentes crudas — el
+	 * synthesize del aiService hace la extracción y síntesis en su única
+	 * call.
 	 *
-	 * Fuentes cortas (<EXTRACTOR_MIN_CHARS) salteán el extractor y se
-	 * devuelven crudas.
-	 */
-	private async extractFromSource(
-		query: string,
-		rawContent: string,
-	): Promise<string> {
-		if (rawContent.length < this.EXTRACTOR_MIN_CHARS) return rawContent;
-		return await aiService.extractRelevantFacts(query, rawContent);
-	}
-
-	/**
-	 * Loop adaptativo de investigación web. Recibe las queries iniciales
-	 * (ya generadas por el modelo, típicamente vía aiService.generateSearchQueries)
-	 * y evalúa tras cada ronda si necesita buscar más (0-N adicionales).
-	 * Se detiene cuando el modelo está satisfecho o se alcanzan MAX_QUERIES (5).
-	 *
-	 * El call site es quien decide si investigar (consultando al modelo) y reclama
-	 * recursos como rate-limit antes de llamar acá. Esto evita que decisiones del
-	 * modelo de "no investigar" gasten slots de rate limit u otros recursos.
+	 * Cero llamadas al LLM dentro de este servicio. Reemplaza al loop
+	 * adaptativo anterior que hacía 1 picker + 1 extract por fuente +
+	 * 1 eval por ronda. El nuevo flow vive en aiService.planResponse +
+	 * aiService.synthesizeAnswer (2 calls totales).
 	 */
 	async researchMultiple(
-		query: string,
+		_query: string,
 		initialQueries: string[],
 		onProgress?: (description: string) => Promise<void>,
 	): Promise<ResearchResult | null> {
 		if (!initialQueries.length) return null;
-		const seenUrls = new Set<string>();
-		const sources: { url: string; content: string }[] = [];
-		const executedQueries: string[] = [];
-		let queriesRun = 0;
-		const pending = [...initialQueries];
 
-		// Loop adaptativo: corre queries, evalúa resultados, repite si hace falta
-		while (pending.length && queriesRun < this.MAX_QUERIES) {
-			const searchQuery = pending.shift();
-			if (!searchQuery) break;
-			queriesRun++;
-			executedQueries.push(searchQuery);
+		await onProgress?.(
+			`🔍 Buscando: ${initialQueries.map((q) => `\`${q}\``).join(", ")}`,
+		);
 
-			await onProgress?.(`🔍 Búsqueda ${queriesRun}: \`${searchQuery}\`...`);
+		// 1. SERP en paralelo para todas las queries
+		const serpResults = await Promise.all(
+			initialQueries.map((q) => this.searchDDGLite(q, 5)),
+		);
 
-			// Pedimos hasta 5 URLs del SERP, filtramos las ya extraídas
-			// (cross-round dedup estilo Perplexica alreadyExtractedURLs) y
-			// rankeamos por heurística de dominio (en lugar de un LLM call
-			// adicional, que sumaba demasiados requests).
-			const searchResult = await this.searchDDGLite(searchQuery, 5);
-			const candidates = this.rankUrlsByReputation(
-				searchResult?.urls.filter((u) => !seenUrls.has(u)) ?? [],
-			);
-			const newUrl = candidates[0] ?? null;
+		// 2. Junta candidatos, deduplica, rankea heurísticamente
+		const allUrls = serpResults.flatMap((r) => r?.urls ?? []);
+		const uniqueUrls = [...new Set(allUrls)];
+		const rankedUrls = this.rankUrlsByReputation(uniqueUrls).slice(
+			0,
+			this.MAX_SOURCES,
+		);
+		if (!rankedUrls.length) return null;
 
-			if (newUrl) {
-				seenUrls.add(newUrl);
-				const rawContent = await this.fetchMarkdown(
-					newUrl,
-					this.FETCH_MAX_CHARS,
-				);
-				if (rawContent?.trim()) {
-					await onProgress?.(
-						`📝 Extrayendo info relevante de fuente ${sources.length + 1}...`,
-					);
-					const content = await this.extractFromSource(query, rawContent);
-					if (content.trim()) {
-						sources.push({ url: newUrl, content });
-						await onProgress?.(`✅ Fuente ${sources.length} obtenida.`);
-					}
-				}
-			}
+		await onProgress?.(
+			`📄 Leyendo ${rankedUrls.length} fuente(s) en paralelo...`,
+		);
 
-			// Al agotar la cola, el modelo evalúa si los resultados son suficientes
-			if (!pending.length && queriesRun < this.MAX_QUERIES && sources.length) {
-				await onProgress?.("🧠 Evaluando si se necesita más información...");
-				const more = await aiService.evaluateSearchProgress(
-					query,
-					sources,
-					this.MAX_QUERIES - queriesRun,
-					executedQueries,
-				);
-				pending.push(...more);
-			}
-		}
-
+		// 3. Fetch markdown de las top fuentes en paralelo
+		const fetched = await Promise.all(
+			rankedUrls.map((url) =>
+				this.fetchMarkdown(url, this.FETCH_MAX_CHARS).then((content) =>
+					content?.trim() ? { url, content } : null,
+				),
+			),
+		);
+		const sources = fetched.filter(
+			(s): s is { url: string; content: string } => s !== null,
+		);
 		if (!sources.length) return null;
+
+		await onProgress?.(
+			`✅ ${sources.length} fuente(s) obtenidas, sintetizando...`,
+		);
 
 		const sourceUrls = sources.map((s) => s.url);
 		const contextForAI = [
@@ -226,6 +192,7 @@ class WebResearchService {
 
 		return {
 			contextForAI,
+			sources,
 			sourceUrl: sourceUrls.at(0) ?? "",
 			sourceUrls,
 		};

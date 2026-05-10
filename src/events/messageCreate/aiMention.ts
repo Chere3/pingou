@@ -129,42 +129,64 @@ export async function handleAiMention(
 			}
 		: undefined;
 
+	// MEGA-CALL #1: una sola call al modelo decide si necesita research,
+	// genera queries, y trae un answer (directo o fallback). Si no hay
+	// research, terminamos en 1 sola llamada total.
 	let webResult: Awaited<
 		ReturnType<typeof webResearchService.researchMultiple>
 	> = null;
-	if (shouldResearch) {
-		// Primero el modelo decide si vale la pena investigar (gratis: no
-		// cuesta slot ni red). Solo si devuelve queries reales reclamamos
-		// un slot del rate limit y arrancamos el loop de búsqueda.
-		const initialQueries = await aiService.generateSearchQueries(cleanContent);
+	let text: string;
+	let usage: Awaited<ReturnType<typeof aiService.synthesizeAnswer>>["usage"];
 
-		if (initialQueries.length) {
+	if (shouldResearch) {
+		await onProgress?.("🤔 Planeando respuesta...");
+		const plan = await aiService.planResponse(cleanContent);
+
+		if (plan.needsResearch && plan.queries.length) {
 			const slot = await cooldownService
 				.claimRateLimitSlot(userId, "ai-research", 2, 60)
 				.catch((err) => {
 					console.error("Error claiming research slot:", err);
 					return { ok: true } as const;
 				});
+
 			if (slot.ok) {
 				webResult = await webResearchService.researchMultiple(
 					cleanContent,
-					initialQueries,
+					plan.queries,
 					onProgress,
 				);
+
+				if (webResult?.sources.length) {
+					// MEGA-CALL #2: synthesize con fuentes crudas. Hace
+					// filtración + extracción + síntesis + citas en 1 call.
+					const synth = await aiService.synthesizeAnswer(
+						cleanContent,
+						webResult.sources,
+					);
+					text = synth.text;
+					usage = synth.usage;
+				} else {
+					// Investigación no devolvió fuentes — usamos el fallback del plan
+					text = plan.answer;
+				}
 			} else {
 				await onProgress?.(
-					`⏳ Límite de investigación alcanzado (2/min). Respondiendo sin contexto web — espera **${slot.retryAfter}s** para volver a buscar.`,
+					`⏳ Límite de investigación alcanzado (2/min). Respondiendo con conocimiento del modelo — espera **${slot.retryAfter}s** para volver a buscar.`,
 				);
+				text = plan.answer;
 			}
+		} else {
+			// El modelo decidió que no hace falta research, usamos su answer directo
+			text = plan.answer;
 		}
+	} else {
+		// Camino sin research por config / contenido muy corto / mención sin texto
+		// (vamos al chat clásico con history de mensajes previos)
+		const chatResult = await aiService.chat(promptMessages);
+		text = chatResult.text;
+		usage = chatResult.usage;
 	}
-
-	// aiService.chat ya devuelve texto fallback ante cualquier fallo de IA,
-	// así que no necesitamos wrap defensivo aquí.
-	const { text, usage } = await aiService.chat(
-		promptMessages,
-		webResult?.contextForAI,
-	);
 
 	await cooldownService
 		.setCooldown(userId, cooldownKey, 15)
