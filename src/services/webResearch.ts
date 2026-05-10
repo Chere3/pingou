@@ -1,103 +1,16 @@
-export type ResearchCategory =
-	| "python"
-	| "javascript"
-	| "typescript"
-	| "react"
-	| "nodejs"
-	| "rust"
-	| "go"
-	| "java"
-	| "css"
-	| "html"
-	| "database"
-	| "general";
+import { aiService } from "@/services/ai";
 
 export interface ResearchResult {
-	category: ResearchCategory;
 	contextForAI: string;
 	sourceUrl: string;
 	sourceUrls?: string[];
 }
-
-const TECH_PATTERNS: Array<[ResearchCategory, RegExp]> = [
-	[
-		"python",
-		/\bpython\b|\.py\b|\bpip\b|django|flask|fastapi|pandas|numpy|pytest|asyncio/i,
-	],
-	[
-		"typescript",
-		/\btypescript\b|\.tsx?\b|type\s+script|interface\s+\w|\benum\s+\w/i,
-	],
-	[
-		"react",
-		/\breact\b|\.jsx\b|\.tsx\b|usestate|useeffect|next\.?js|zustand|react-query/i,
-	],
-	[
-		"nodejs",
-		/node\.?js|\bnpm\b|\bbun\b(?!ny)|\bdeno\b|express|hono|fastify|elysia/i,
-	],
-	["rust", /\brust\b|\bcargo\b|rustup|borrow\s+checker|tokio|actix/i],
-	["go", /\bgolang\b|goroutine|go\s+func|go\s+chan|\bdefer\b.*go\b/i],
-	["java", /\bjava\b(?!script)|spring|maven|gradle|\bjvm\b|hibernate/i],
-	[
-		"css",
-		/\bcss\b|tailwind(?:css)?|flexbox|\bgrid\b(?!\s+id)|sass|scss|bootstrap/i,
-	],
-	["html", /\bhtml\b|\bdom\b|<[a-z][a-z0-9]*[\s>]|etiqueta\s+html/i],
-	[
-		"database",
-		/\bsql\b|postgres(?:ql)?|mysql|mongodb|redis|drizzle|prisma|\borm\b/i,
-	],
-	[
-		"javascript",
-		/\bjavascript\b|\bjs\b|es6|es20\d\d|async\/await|\bpromise\b|\bfetch\b|closure/i,
-	],
-];
-
-const SEARCH_PREFIXES: Record<ResearchCategory, string> = {
-	python: "python docs",
-	javascript: "javascript mdn",
-	typescript: "typescript docs",
-	react: "react docs",
-	nodejs: "nodejs docs",
-	rust: "rust lang docs",
-	go: "golang docs",
-	java: "java docs",
-	css: "css mdn",
-	html: "html mdn",
-	database: "sql docs",
-	general: "",
-};
 
 class WebResearchService {
 	private readonly JINA_BASE = "https://r.jina.ai/";
 	private readonly FETCH_TIMEOUT_MS = 8_000;
 	private readonly MAX_CONTENT_CHARS = 3_000;
 	private readonly MAX_CONTENT_CHARS_MULTI = 1_500;
-
-	detectCategory(query: string): ResearchCategory {
-		for (const [category, pattern] of TECH_PATTERNS) {
-			if (pattern.test(query)) return category;
-		}
-		return "general";
-	}
-
-	shouldResearch(query: string): boolean {
-		if (query.length < 30) return false;
-		const q = query.toLowerCase();
-		return (
-			/error|exception|bug|undefined|cannot|typeerror|syntaxerror|importerror/.test(
-				q,
-			) ||
-			/cómo|como\s|how\s|qué\s|que\s+es|what\s+is|cuándo|por\s+qué|why\s|when\s/.test(
-				q,
-			) ||
-			/versión|version|v\d+\.\d+|\bapi\b|library|librería|package|módulo/.test(
-				q,
-			) ||
-			TECH_PATTERNS.some(([, pattern]) => pattern.test(q))
-		);
-	}
 
 	private async fetchWithTimeout(
 		url: string,
@@ -139,8 +52,10 @@ class WebResearchService {
 			// Extraer URLs reales de los redirects DDG (?uddg=URL_ENCODED)
 			const urls = [...text.matchAll(/uddg=([^&\s")\]]+)/g)]
 				.map((m) => {
+					const raw = m[1];
+					if (!raw) return null;
 					try {
-						return decodeURIComponent(m[1]);
+						return decodeURIComponent(raw);
 					} catch {
 						return null;
 					}
@@ -176,68 +91,23 @@ class WebResearchService {
 	}
 
 	/**
-	 * Genera 2-3 variantes de búsqueda para la misma pregunta.
-	 */
-	generateQueries(query: string): string[] {
-		const category = this.detectCategory(query);
-		const prefix = SEARCH_PREFIXES[category];
-		const q = query.trim().replace(/[¿¡]/g, "");
-		const queries: string[] = [];
-
-		// 1. Búsqueda principal con prefijo de tecnología
-		queries.push(prefix ? `${prefix} ${q}` : q);
-
-		// 2a. Si hay error concreto, buscar fix específico
-		if (
-			/error|exception|bug|crash|undefined|cannot|typeerror|syntaxerror/i.test(
-				q,
-			)
-		) {
-			queries.push(`how to fix ${q.replace(/[?]/g, "").trim()}`);
-		}
-		// 2b. Si es "cómo/qué es", buscar ejemplo/guía
-		else if (
-			/cómo|como\s|how\s|qué\s|que\s+es|what\s+is|ejemplo|example/i.test(q)
-		) {
-			const core = q
-				.replace(/cómo|como|how to|how do|qué es|que es|what is|[?]/gi, "")
-				.trim();
-			if (core.length > 5) {
-				queries.push(
-					`${prefix ? `${prefix} ` : ""}${core} example guide`.trim(),
-				);
-			}
-		}
-
-		// 3. Stack Overflow para preguntas técnicas
-		if (category !== "general" && queries.length < 3) {
-			const core = q
-				.replace(/[?¿¡!]/g, "")
-				.split(/\s+/)
-				.slice(0, 8)
-				.join(" ");
-			queries.push(`site:stackoverflow.com ${core}`);
-		}
-
-		return [...new Set(queries)].slice(0, 3);
-	}
-
-	/**
-	 * Multi-búsqueda: para cada query variante, busca con DDG Lite (Jina),
-	 * extrae las URLs de los resultados, lee la primera URL con Jina Reader,
-	 * y llama a `onProgress` en vivo tras cada fuente obtenida.
+	 * Multi-búsqueda: el modelo genera 2-3 queries optimizadas para la pregunta,
+	 * luego busca cada una con DDG Lite (Jina), extrae la primera URL nueva,
+	 * la lee con Jina Reader y llama a `onProgress` en vivo tras cada fuente.
 	 */
 	async researchMultiple(
 		query: string,
 		onProgress?: (description: string) => Promise<void>,
 	): Promise<ResearchResult | null> {
-		const category = this.detectCategory(query);
-		const queries = this.generateQueries(query);
+		await onProgress?.("🤔 Generando queries de búsqueda...");
+		const queries = await aiService.generateSearchQueries(query);
+
 		const seenUrls = new Set<string>();
 		const sources: { url: string; content: string }[] = [];
 
 		for (let i = 0; i < queries.length; i++) {
 			const searchQuery = queries[i];
+			if (!searchQuery) continue;
 			await onProgress?.(
 				`🔍 Buscando (${i + 1}/${queries.length}): \`${searchQuery}\`...`,
 			);
@@ -283,24 +153,21 @@ class WebResearchService {
 			"[Fin del contexto web]",
 		].join("\n\n");
 
+		const sourceUrls = sources.map((s) => s.url);
 		return {
-			category,
 			contextForAI,
-			sourceUrl: sources[0].url,
-			sourceUrls: sources.map((s) => s.url),
+			sourceUrl: sourceUrls.at(0) ?? "",
+			sourceUrls,
 		};
 	}
 
 	/**
-	 * Búsqueda simple (sin progreso en vivo). Busca con DDG Lite y lee
-	 * la primera URL relevante con Jina Reader.
+	 * Búsqueda simple (sin progreso en vivo). El modelo genera la primera
+	 * query óptima y lee la primera URL relevante con Jina Reader.
 	 */
 	async research(query: string): Promise<ResearchResult | null> {
-		const category = this.detectCategory(query);
-		const prefix = SEARCH_PREFIXES[category];
-		const searchQuery = prefix ? `${prefix} ${query}` : query;
-
-		const searchResult = await this.searchDDGLite(searchQuery, 1);
+		const queries = await aiService.generateSearchQueries(query);
+		const searchResult = await this.searchDDGLite(queries[0] ?? query, 1);
 		const url = searchResult?.urls[0];
 		if (!url) return null;
 
@@ -313,7 +180,7 @@ class WebResearchService {
 			"[Fin del contexto web]",
 		].join("\n\n");
 
-		return { category, contextForAI, sourceUrl: url };
+		return { contextForAI, sourceUrl: url };
 	}
 }
 

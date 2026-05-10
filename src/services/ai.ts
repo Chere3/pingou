@@ -136,6 +136,42 @@ export class AIService {
 	}
 
 	/**
+	 * Genera 2-3 queries de búsqueda web optimizadas para la pregunta dada.
+	 * El modelo extrae las keywords clave y las reformula como consultas
+	 * directas para un buscador. Falla silenciosamente devolviendo [query].
+	 */
+	async generateSearchQueries(query: string): Promise<string[]> {
+		if (!process.env.AI_API_KEY) return [query];
+		const truncated = query.slice(0, 400);
+		try {
+			const result = await this.ai.chat.completions.create({
+				model: this.model,
+				max_tokens: 80,
+				temperature: 0,
+				messages: [
+					{
+						role: "system",
+						content:
+							"Eres un experto en búsquedas web técnicas. Dada una pregunta o problema, genera 2 o 3 queries de búsqueda concisas y específicas para encontrar documentación o soluciones. Responde ÚNICAMENTE con las queries, una por línea, sin numeración ni explicaciones.",
+					},
+					{
+						role: "user",
+						content: `Pregunta: "${truncated}"\n\nQueries de búsqueda:`,
+					},
+				],
+			});
+			const lines = (result.choices[0]?.message?.content ?? "")
+				.split("\n")
+				.map((l) => l.replace(/^[\s\-*•·\d.]+/, "").trim())
+				.filter((l) => l.length > 3)
+				.slice(0, 3);
+			return lines.length > 0 ? lines : [query];
+		} catch {
+			return [query];
+		}
+	}
+
+	/**
 	 * Usa el modelo para decidir si la pregunta requiere búsqueda web.
 	 * Mucho más preciso que heurísticas de regex. Falla silenciosamente
 	 * devolviendo `false` si no hay clave o hay error de red.
