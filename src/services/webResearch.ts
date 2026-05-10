@@ -104,6 +104,7 @@ class WebResearchService {
 		if (!initialQueries.length) return null;
 		const seenUrls = new Set<string>();
 		const sources: { url: string; content: string }[] = [];
+		const executedQueries: string[] = [];
 		let queriesRun = 0;
 		const pending = [...initialQueries];
 
@@ -112,6 +113,7 @@ class WebResearchService {
 			const searchQuery = pending.shift();
 			if (!searchQuery) break;
 			queriesRun++;
+			executedQueries.push(searchQuery);
 
 			await onProgress?.(`🔍 Búsqueda ${queriesRun}: \`${searchQuery}\`...`);
 
@@ -137,6 +139,7 @@ class WebResearchService {
 					query,
 					sources,
 					this.MAX_QUERIES - queriesRun,
+					executedQueries,
 				);
 				pending.push(...more);
 			}

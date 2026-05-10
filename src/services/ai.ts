@@ -230,12 +230,19 @@ Ejemplos:
 
 	/**
 	 * Evalúa el contenido encontrado hasta ahora y decide si se necesitan
-	 * más búsquedas. Devuelve [] (done) o hasta `maxAdditional` queries nuevas.
+	 * más búsquedas, identificando GAPS específicos en lugar de queries
+	 * arbitrarias. También recibe la lista de queries ya ejecutadas para
+	 * evitar pedir variantes equivalentes (patrón de STORM AskQuestion +
+	 * GPT Researcher context-aware refinement).
+	 *
+	 * Devuelve [] cuando done = true. Si pide más, hasta maxAdditional
+	 * queries enfocadas en los gaps que el modelo identificó.
 	 */
 	async evaluateSearchProgress(
 		query: string,
 		sources: { url: string; content: string }[],
 		maxAdditional: number,
+		previousQueries: string[] = [],
 	): Promise<string[]> {
 		if (!process.env.AI_API_KEY || maxAdditional <= 0) return [];
 
@@ -244,29 +251,66 @@ Ejemplos:
 			.join("\n\n---\n\n")
 			.slice(0, 3_000);
 
+		const previousQueriesBlock = previousQueries.length
+			? `\n\nQueries ya ejecutadas (NO repetir ni pedir variantes equivalentes):\n${previousQueries.map((q) => `- ${q}`).join("\n")}`
+			: "";
+
 		try {
 			const result = await this.ai.chat.completions.create({
 				model: this.model,
-				max_tokens: 100,
+				max_tokens: 200,
 				temperature: 0,
+				response_format: { type: "json_object" },
 				messages: [
 					{
 						role: "system",
-						content: `Eres un agente de investigación web. Evalúa si el contenido encontrado responde bien la pregunta original. Si es suficiente, responde solo "DONE". Si necesitas más información, genera hasta ${maxAdditional} queries de búsqueda adicionales, una por línea, sin numeración ni explicaciones.`,
+						content: `Sos un evaluador de progreso de investigación web. Recibís la pregunta original, el contenido recolectado y las queries ya ejecutadas. Tu tarea: identificar GAPS (huecos de información) y proponer queries que los llenen específicamente.
+
+Responde SIEMPRE con un objeto JSON con esta forma:
+{ "done": boolean, "gaps": string[], "queries": string[] }
+
+- done = true si el contenido es suficiente para responder bien la pregunta original. En ese caso gaps = [] y queries = [].
+- done = false si faltan piezas. gaps describe qué falta (1-3 ítems en español, cortos). queries son hasta ${maxAdditional} búsquedas en inglés que apuntan a esos gaps específicos.
+
+Reglas para queries nuevas:
+1. NO repetir queries ya ejecutadas ni variantes ortográficas equivalentes.
+2. Cada query debe apuntar a un gap concreto, no a la pregunta general.
+3. Si el contenido cubre bien todo y solo faltan detalles menores, preferí done = true.
+
+Ejemplo:
+{ "done": false, "gaps": ["versión actual del proyecto", "ejemplos de código"], "queries": ["openclaw current version release", "openclaw code example"] }`,
 					},
 					{
 						role: "user",
-						content: `Pregunta: "${query.slice(0, 300)}"\n\nContenido encontrado:\n${contentSummary}\n\n¿Es suficiente para responder?`,
+						content: `Pregunta original: "${query.slice(0, 300)}"
+
+Contenido encontrado:
+${contentSummary}${previousQueriesBlock}
+
+¿Es suficiente? Si no, ¿qué gaps quedan y qué queries los llenan?`,
 					},
 				],
 			});
-			const text = (result.choices[0]?.message?.content ?? "").trim();
-			if (!text || /^done$/i.test(text)) return [];
-			return text
-				.split("\n")
-				.map((l) => l.replace(/^[\s\-*•·\d.]+/, "").trim())
-				.filter((l) => l.length > 3)
+			const raw = result.choices[0]?.message?.content ?? "";
+			const parsed = this.parseLooseJson<{
+				done?: boolean;
+				queries?: unknown;
+			}>(raw);
+
+			if (!parsed || parsed.done === true) return [];
+			if (!Array.isArray(parsed.queries)) return [];
+
+			const previousLower = new Set(
+				previousQueries.map((q) => q.trim().toLowerCase()),
+			);
+			const queries = parsed.queries
+				.filter(
+					(q): q is string => typeof q === "string" && q.trim().length > 3,
+				)
+				.map((q) => q.trim())
+				.filter((q) => !previousLower.has(q.toLowerCase()))
 				.slice(0, maxAdditional);
+			return queries;
 		} catch {
 			return [];
 		}
