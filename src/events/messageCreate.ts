@@ -150,78 +150,77 @@ export default createEvent({
 					}
 				: undefined;
 
-			try {
-				let webResult: Awaited<
-					ReturnType<typeof webResearchService.researchMultiple>
-				> = null;
-				if (shouldResearch) {
-					// Primero el modelo decide si vale la pena investigar (gratis: no
-					// cuesta slot ni red). Solo si devuelve queries reales reclamamos
-					// un slot del rate limit y arrancamos el loop de búsqueda.
-					const initialQueries =
-						await aiService.generateSearchQueries(cleanContent);
+			let webResult: Awaited<
+				ReturnType<typeof webResearchService.researchMultiple>
+			> = null;
+			if (shouldResearch) {
+				// Primero el modelo decide si vale la pena investigar (gratis: no
+				// cuesta slot ni red). Solo si devuelve queries reales reclamamos
+				// un slot del rate limit y arrancamos el loop de búsqueda.
+				const initialQueries =
+					await aiService.generateSearchQueries(cleanContent);
 
-					if (initialQueries.length > 0) {
-						const slot = await cooldownService.claimRateLimitSlot(
-							userId,
-							"ai-research",
-							2,
-							60,
+				if (initialQueries.length) {
+					const slot = await cooldownService
+						.claimRateLimitSlot(userId, "ai-research", 2, 60)
+						.catch((err) => {
+							console.error("Error claiming research slot:", err);
+							return { ok: true } as const;
+						});
+					if (slot.ok) {
+						webResult = await webResearchService.researchMultiple(
+							cleanContent,
+							initialQueries,
+							onProgress,
 						);
-						if (slot.ok) {
-							webResult = await webResearchService.researchMultiple(
-								cleanContent,
-								initialQueries,
-								onProgress,
-							);
-						} else {
-							await onProgress?.(
-								`⏳ Límite de investigación alcanzado (2/min). Respondiendo sin contexto web — espera **${slot.retryAfter}s** para volver a buscar.`,
-							);
-						}
+					} else {
+						await onProgress?.(
+							`⏳ Límite de investigación alcanzado (2/min). Respondiendo sin contexto web — espera **${slot.retryAfter}s** para volver a buscar.`,
+						);
 					}
 				}
+			}
 
-				const { text, usage } = await aiService.chat(
-					promptMessages,
-					webResult?.contextForAI,
-				);
+			// aiService.chat ya devuelve texto fallback ante cualquier fallo de IA,
+			// así que no necesitamos wrap defensivo aquí.
+			const { text, usage } = await aiService.chat(
+				promptMessages,
+				webResult?.contextForAI,
+			);
 
-				await cooldownService.setCooldown(userId, cooldownKey, 15);
+			await cooldownService
+				.setCooldown(userId, cooldownKey, 15)
+				.catch((err) => console.error("Error setting AI cooldown:", err));
 
-				const embeds = Embeds.aiReplyEmbeds(
-					text,
-					usage,
-					webResult?.sourceUrl,
-					webResult?.sourceUrls,
-				);
+			const embeds = Embeds.aiReplyEmbeds(
+				text,
+				usage,
+				webResult?.sourceUrl,
+				webResult?.sourceUrls,
+			);
 
-				if (statusMsg) {
-					await client.messages.edit(statusMsg.id, statusMsg.channelId, {
+			if (statusMsg) {
+				await client.messages
+					.edit(statusMsg.id, statusMsg.channelId, {
 						embeds: [embeds[0] as APIEmbed],
-					});
-					for (const embed of embeds.slice(1)) {
-						await message.reply({ embeds: [embed] });
-					}
-				} else {
-					// Mención sin texto — usó contexto de mensajes previos
-					for (const embed of embeds) {
-						await message.reply({ embeds: [embed] });
-					}
+					})
+					.catch((err) =>
+						console.error("Error editing AI reply status embed:", err),
+					);
+				for (const embed of embeds.slice(1)) {
+					await message
+						.reply({ embeds: [embed] })
+						.catch((err) =>
+							console.error("Error sending AI reply chunk:", err),
+						);
 				}
-			} catch (error) {
-				console.error("Error in AI mention reply:", error);
-				const errorEmbed = Embeds.errorEmbed(
-					"Error de IA",
-					"Ocurrió un error al procesar tu pregunta. Por favor, intentá más tarde.",
-				);
-				await (statusMsg
-					? client.messages
-							.edit(statusMsg.id, statusMsg.channelId, {
-								embeds: [errorEmbed],
-							})
-							.catch(() => message.reply({ embeds: [errorEmbed] }))
-					: message.reply({ embeds: [errorEmbed] }));
+			} else {
+				// Mención sin texto — usó contexto de mensajes previos
+				for (const embed of embeds) {
+					await message
+						.reply({ embeds: [embed] })
+						.catch((err) => console.error("Error sending AI reply:", err));
+				}
 			}
 			return;
 		}

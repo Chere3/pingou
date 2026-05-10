@@ -60,12 +60,7 @@ export const Embeds = {
 			? `Respuesta IA | I: ${input} | O: ${output}`
 			: "Respuesta IA";
 
-		const urls =
-			sourceUrls && sourceUrls.length > 0
-				? sourceUrls
-				: sourceUrl
-					? [sourceUrl]
-					: [];
+		const urls = sourceUrls?.length ? sourceUrls : sourceUrl ? [sourceUrl] : [];
 
 		if (urls.length === 1) {
 			footerText += ` | 🔍 ${urls[0]}`;

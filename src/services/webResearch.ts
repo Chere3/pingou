@@ -101,14 +101,14 @@ class WebResearchService {
 		initialQueries: string[],
 		onProgress?: (description: string) => Promise<void>,
 	): Promise<ResearchResult | null> {
-		if (initialQueries.length === 0) return null;
+		if (!initialQueries.length) return null;
 		const seenUrls = new Set<string>();
 		const sources: { url: string; content: string }[] = [];
 		let queriesRun = 0;
 		const pending = [...initialQueries];
 
 		// Loop adaptativo: corre queries, evalúa resultados, repite si hace falta
-		while (pending.length > 0 && queriesRun < this.MAX_QUERIES) {
+		while (pending.length && queriesRun < this.MAX_QUERIES) {
 			const searchQuery = pending.shift();
 			if (!searchQuery) break;
 			queriesRun++;
@@ -131,20 +131,18 @@ class WebResearchService {
 			}
 
 			// Al agotar la cola, el modelo evalúa si los resultados son suficientes
-			if (pending.length === 0 && queriesRun < this.MAX_QUERIES) {
-				if (sources.length > 0) {
-					await onProgress?.("🧠 Evaluando si se necesita más información...");
-					const more = await aiService.evaluateSearchProgress(
-						query,
-						sources,
-						this.MAX_QUERIES - queriesRun,
-					);
-					pending.push(...more);
-				}
+			if (!pending.length && queriesRun < this.MAX_QUERIES && sources.length) {
+				await onProgress?.("🧠 Evaluando si se necesita más información...");
+				const more = await aiService.evaluateSearchProgress(
+					query,
+					sources,
+					this.MAX_QUERIES - queriesRun,
+				);
+				pending.push(...more);
 			}
 		}
 
-		if (sources.length === 0) return null;
+		if (!sources.length) return null;
 
 		const sourceUrls = sources.map((s) => s.url);
 		const contextForAI = [
