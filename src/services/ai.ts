@@ -317,14 +317,17 @@ ${contentSummary}${previousQueriesBlock}
 	}
 
 	/**
-	 * Extractor estilo Perplexica scrapeURL.ts: dado un fragmento de markdown
+	 * Extractor estilo Perplexica scrapeURL.ts: dado el markdown crudo
 	 * scrapeado y la pregunta original, devuelve bullets en formato
 	 * telegram-style con los hechos relevantes. Preserva números y nombres
-	 * exactos, descarta marketing/nav/footer. Si el chunk no tiene info
-	 * relevante devuelve "".
+	 * exactos, descarta marketing/nav/footer.
 	 *
-	 * Falla silenciosamente devolviendo un slice del chunk como fallback —
-	 * peor que perfecto pero mejor que perder la fuente entera.
+	 * Una sola call por fuente con el contenido completo (hasta ~8k chars).
+	 * No usamos chunking para mantener bajo el conteo de requests al
+	 * provider de IA (qwen3-coder en NVIDIA Integrate tiene rate limit).
+	 *
+	 * Falla silenciosamente devolviendo un slice como fallback — peor que
+	 * perfecto pero mejor que perder la fuente entera.
 	 */
 	async extractRelevantFacts(query: string, chunk: string): Promise<string> {
 		if (!process.env.AI_API_KEY) return chunk.slice(0, 800);
@@ -364,71 +367,6 @@ Fragmento: "...Bun is a fast all-in-one JavaScript runtime... Released in 2022 b
 			return parsed?.facts ?? chunk.slice(0, 800);
 		} catch {
 			return chunk.slice(0, 800);
-		}
-	}
-
-	/**
-	 * Picker estilo Perplexica baseSearch.ts pickerPrompt: dado una pregunta
-	 * y una lista numerada de URLs candidatas, devuelve el índice de la URL
-	 * con mejor combinación de relevancia + reputación de dominio + diversidad
-	 * (evitar duplicados temáticos).
-	 *
-	 * Reemplaza al "primer URL no visto" del SERP por una elección informada.
-	 * Si hay 0-1 candidatos no hay nada que elegir; si hay 2+ se hace la
-	 * llamada al modelo. Falla devolviendo el primer candidato (fallback
-	 * equivalente al comportamiento anterior).
-	 */
-	async pickBestUrl(
-		query: string,
-		candidates: string[],
-	): Promise<string | null> {
-		if (!candidates.length) return null;
-		if (candidates.length === 1) return candidates[0] ?? null;
-		if (!process.env.AI_API_KEY) return candidates[0] ?? null;
-
-		const numbered = candidates.map((url, i) => `${i}. ${url}`).join("\n");
-
-		try {
-			const result = await this.ai.chat.completions.create({
-				model: this.model,
-				max_tokens: 60,
-				temperature: 0,
-				response_format: { type: "json_object" },
-				messages: [
-					{
-						role: "system",
-						content: `Sos un evaluador de fuentes web. Recibís una pregunta y una lista numerada de URLs candidatas. Elegí la URL MÁS PROBABLEMENTE útil para responder, considerando:
-
-1. Relevancia: el dominio/path sugiere que el contenido aborda la pregunta
-2. Reputación: docs oficiales > github oficial > stackoverflow > MDN/devdocs > blogs técnicos conocidos > blogs random > spam/clickbait
-3. Especificidad: paths que mencionan el tema concreto > home pages genéricas
-
-Responde con JSON: { "pick": <índice numérico> }`,
-					},
-					{
-						role: "user",
-						content: `Pregunta: "${query.slice(0, 200)}"
-
-Candidatos:
-${numbered}`,
-					},
-				],
-			});
-			const raw = result.choices[0]?.message?.content ?? "";
-			const parsed = this.parseLooseJson<{ pick?: number }>(raw);
-			const idx = parsed?.pick;
-
-			if (
-				typeof idx === "number" &&
-				Number.isInteger(idx) &&
-				idx >= 0 &&
-				idx < candidates.length
-			) {
-				return candidates[idx] ?? null;
-			}
-			return candidates[0] ?? null;
-		} catch {
-			return candidates[0] ?? null;
 		}
 	}
 

@@ -9,17 +9,14 @@ export interface ResearchResult {
 class WebResearchService {
 	private readonly JINA_BASE = "https://r.jina.ai/";
 	private readonly FETCH_TIMEOUT_MS = 8_000;
-	private readonly MAX_QUERIES = 5;
+	// Cap total de queries en el loop adaptativo. Cada query = 1 fetch + 1 LLM
+	// call (extractor). El chat final agrega 1 call más.
+	private readonly MAX_QUERIES = 4;
 	// Cuánto markdown bruto traer por URL desde Jina Reader. El extractor
-	// por chunks se encarga de filtrar después.
-	private readonly FETCH_MAX_CHARS = 12_000;
-	// Chunks pasados al extractor LLM por fuente.
-	private readonly CHUNK_SIZE = 4_000;
-	private readonly CHUNK_OVERLAP = 500;
-	// Cap de chunks procesados por fuente para acotar latencia (paralelo).
-	private readonly MAX_CHUNKS_PER_SOURCE = 3;
+	// recibe esto entero en una sola call para no explotar requests.
+	private readonly FETCH_MAX_CHARS = 8_000;
 	// Para fuentes cortas no vale la pena el round trip del extractor.
-	private readonly EXTRACTOR_MIN_CHARS = 2_000;
+	private readonly EXTRACTOR_MIN_CHARS = 1_500;
 
 	private async fetchWithTimeout(
 		url: string,
@@ -96,58 +93,52 @@ class WebResearchService {
 	}
 
 	/**
-	 * Splitter char-based con overlap. No corta en límites de palabra (los
-	 * chunks pueden empezar/terminar mid-token) — el extractor LLM tolera
-	 * eso fácilmente. El overlap previene perder info que esté en el límite.
+	 * Ranking heurístico de URLs por reputación de dominio + señales de
+	 * spam/junk. Reemplaza al LLM picker para ahorrar llamadas al modelo
+	 * (rate limit del provider). Los dominios y patrones son inferidos del
+	 * uso real de la comunidad de programación.
 	 */
-	private splitText(
-		text: string,
-		chunkSize: number,
-		overlap: number,
-	): string[] {
-		if (text.length <= chunkSize) return [text];
-		const chunks: string[] = [];
-		const stride = chunkSize - overlap;
-		for (let i = 0; i < text.length; i += stride) {
-			chunks.push(text.slice(i, i + chunkSize));
-			if (i + chunkSize >= text.length) break;
-		}
-		return chunks;
+	private rankUrlsByReputation(urls: string[]): string[] {
+		const score = (url: string): number => {
+			const u = url.toLowerCase();
+			let s = 0;
+			// Docs oficiales — máxima prioridad
+			if (/\bdocs?\.(?:[\w-]+\.)+\w+\//.test(u)) s += 12;
+			if (/developer\.mozilla\.org|mdn\b/.test(u)) s += 10;
+			// Source canónicas
+			if (/github\.com\/[^/]+\/[^/]+/.test(u)) s += 8;
+			if (/stackoverflow\.com\/questions/.test(u)) s += 7;
+			if (/wikipedia\.org\/wiki/.test(u)) s += 6;
+			// Sitios oficiales (.io, .dev, .org, github.io de proyectos)
+			if (/github\.io/.test(u)) s += 5;
+			if (/\b(?:\w+\.)+(?:io|dev)\b/.test(u)) s += 3;
+			// Blogs técnicos conocidos
+			if (/dev\.to|medium\.com|hashnode\.com/.test(u)) s += 2;
+			// Penalizaciones
+			if (/pinterest|tiktok|facebook|instagram/.test(u)) s -= 8;
+			if (/[?&](utm_|fbclid|gclid|ref=)/.test(u)) s -= 2;
+			if (/\/(?:tag|tags|category|categories)\//.test(u)) s -= 3;
+			return s;
+		};
+		return [...urls].sort((a, b) => score(b) - score(a));
 	}
 
 	/**
-	 * Extrae los hechos relevantes a `query` desde el markdown bruto de una
-	 * fuente. Para fuentes cortas (<EXTRACTOR_MIN_CHARS) devuelve el
-	 * contenido tal cual — no vale la pena el round trip del extractor.
-	 * Para fuentes largas, splittea en chunks (4000/500 overlap), corre el
-	 * extractor en paralelo sobre los primeros MAX_CHUNKS_PER_SOURCE chunks
-	 * y concatena los bullets.
+	 * Extrae los hechos relevantes a `query` con UNA sola call al modelo
+	 * sobre el contenido entero (truncado a FETCH_MAX_CHARS). Reemplaza al
+	 * chunked extractor anterior (que hacía 3 calls paralelas por fuente)
+	 * para ahorrar requests. qwen3-coder-480b tiene context window enorme,
+	 * 8k chars cabe holgadamente.
 	 *
-	 * Si el extractor devuelve vacío para todos los chunks, fallback al
-	 * raw slice — preferimos contexto crudo sobre nada.
+	 * Fuentes cortas (<EXTRACTOR_MIN_CHARS) salteán el extractor y se
+	 * devuelven crudas.
 	 */
 	private async extractFromSource(
 		query: string,
 		rawContent: string,
 	): Promise<string> {
 		if (rawContent.length < this.EXTRACTOR_MIN_CHARS) return rawContent;
-
-		const chunks = this.splitText(
-			rawContent,
-			this.CHUNK_SIZE,
-			this.CHUNK_OVERLAP,
-		).slice(0, this.MAX_CHUNKS_PER_SOURCE);
-
-		const extractions = await Promise.all(
-			chunks.map((chunk) => aiService.extractRelevantFacts(query, chunk)),
-		);
-
-		const combined = extractions
-			.map((e) => e.trim())
-			.filter((e) => e.length > 0)
-			.join("\n");
-
-		return combined || rawContent.slice(0, 1_500);
+		return await aiService.extractRelevantFacts(query, rawContent);
 	}
 
 	/**
@@ -183,12 +174,13 @@ class WebResearchService {
 
 			// Pedimos hasta 5 URLs del SERP, filtramos las ya extraídas
 			// (cross-round dedup estilo Perplexica alreadyExtractedURLs) y
-			// dejamos que el picker del modelo elija la mejor por
-			// relevancia + reputación de dominio.
+			// rankeamos por heurística de dominio (en lugar de un LLM call
+			// adicional, que sumaba demasiados requests).
 			const searchResult = await this.searchDDGLite(searchQuery, 5);
-			const candidates =
-				searchResult?.urls.filter((u) => !seenUrls.has(u)) ?? [];
-			const newUrl = await aiService.pickBestUrl(query, candidates);
+			const candidates = this.rankUrlsByReputation(
+				searchResult?.urls.filter((u) => !seenUrls.has(u)) ?? [],
+			);
+			const newUrl = candidates[0] ?? null;
 
 			if (newUrl) {
 				seenUrls.add(newUrl);
