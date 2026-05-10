@@ -21,7 +21,6 @@ async function boostrap() {
 	await client.start();
 	await client.uploadCommands({
 		cachePath: "./commands.json",
-		...(process.env.DEV_GUILD_ID ? { guildId: process.env.DEV_GUILD_ID } : {}),
 	});
 
 	setInterval(
