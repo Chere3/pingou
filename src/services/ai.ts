@@ -136,9 +136,10 @@ export class AIService {
 	}
 
 	/**
-	 * Genera 2-3 queries de búsqueda web optimizadas para la pregunta dada.
-	 * El modelo extrae las keywords clave y las reformula como consultas
-	 * directas para un buscador. Falla silenciosamente devolviendo [query].
+	 * Decide si la pregunta necesita investigación web y, de ser así, genera
+	 * 1-3 queries iniciales óptimas. Devuelve [] si el modelo considera que
+	 * no hace falta buscar (concepto básico, saludo, pregunta sin contexto
+	 * técnico específico, etc.). Falla silenciosamente devolviendo [query].
 	 */
 	async generateSearchQueries(query: string): Promise<string[]> {
 		if (!process.env.AI_API_KEY) return [query];
@@ -152,15 +153,17 @@ export class AIService {
 					{
 						role: "system",
 						content:
-							"Eres un experto en búsquedas web técnicas. Dada una pregunta o problema, genera 2 o 3 queries de búsqueda concisas y específicas para encontrar documentación o soluciones. Responde ÚNICAMENTE con las queries, una por línea, sin numeración ni explicaciones.",
+							"Eres un agente de investigación web. Decide si la pregunta requiere búsqueda en internet. Si no la necesita (conceptos muy básicos, saludos, preguntas sin detalles técnicos concretos), responde solo 'NONE'. Si la necesita, genera 1-3 queries de búsqueda web concisas y específicas, una por línea, sin numeración ni explicaciones.",
 					},
 					{
 						role: "user",
-						content: `Pregunta: "${truncated}"\n\nQueries de búsqueda:`,
+						content: `Pregunta: "${truncated}"`,
 					},
 				],
 			});
-			const lines = (result.choices[0]?.message?.content ?? "")
+			const text = (result.choices[0]?.message?.content ?? "").trim();
+			if (!text || /^none$/i.test(text)) return [];
+			const lines = text
 				.split("\n")
 				.map((l) => l.replace(/^[\s\-*•·\d.]+/, "").trim())
 				.filter((l) => l.length > 3)
@@ -172,43 +175,46 @@ export class AIService {
 	}
 
 	/**
-	 * Usa el modelo para decidir si la pregunta requiere búsqueda web.
-	 * Mucho más preciso que heurísticas de regex. Falla silenciosamente
-	 * devolviendo `false` si no hay clave o hay error de red.
+	 * Evalúa el contenido encontrado hasta ahora y decide si se necesitan
+	 * más búsquedas. Devuelve [] (done) o hasta `maxAdditional` queries nuevas.
 	 */
-	async classifyNeedsResearch(query: string): Promise<boolean> {
-		if (!process.env.AI_API_KEY || query.length < 10) return false;
-		// Truncamos para no enviar queries enormes al clasificador
-		const truncated = query.slice(0, 400);
+	async evaluateSearchProgress(
+		query: string,
+		sources: { url: string; content: string }[],
+		maxAdditional: number,
+	): Promise<string[]> {
+		if (!process.env.AI_API_KEY || maxAdditional <= 0) return [];
+
+		const contentSummary = sources
+			.map((s, i) => `[Fuente ${i + 1}: ${s.url}]\n${s.content.slice(0, 600)}`)
+			.join("\n\n---\n\n")
+			.slice(0, 3_000);
+
 		try {
 			const result = await this.ai.chat.completions.create({
 				model: this.model,
-				max_tokens: 5,
+				max_tokens: 100,
 				temperature: 0,
 				messages: [
 					{
 						role: "system",
-						content:
-							"Eres un clasificador binario. Responde ÚNICAMENTE con 'SI' o 'NO', sin explicaciones ni puntuación.",
+						content: `Eres un agente de investigación web. Evalúa si el contenido encontrado responde bien la pregunta original. Si es suficiente, responde solo "DONE". Si necesitas más información, genera hasta ${maxAdditional} queries de búsqueda adicionales, una por línea, sin numeración ni explicaciones.`,
 					},
 					{
 						role: "user",
-						content: `¿Esta pregunta de programación se beneficia de buscar documentación o información actualizada en internet (errores específicos, versiones, APIs, librerías)?\n\nPregunta: "${truncated}"\n\nResponde solo SI o NO.`,
+						content: `Pregunta: "${query.slice(0, 300)}"\n\nContenido encontrado:\n${contentSummary}\n\n¿Es suficiente para responder?`,
 					},
 				],
 			});
-			const ans = (result.choices[0]?.message?.content ?? "")
-				.trim()
-				.toUpperCase();
-			return (
-				ans.startsWith("SI") || ans.startsWith("SÍ") || ans.startsWith("YES")
-			);
-		} catch (err) {
-			// Fallback a heurística ligera si el modelo no está disponible
-			console.error("classifyNeedsResearch fallback:", err);
-			return /error|exception|bug|undefined|cannot|typeerror|cómo|como\s|how\s|versión|version|v\d+\.\d+|\bapi\b/i.test(
-				query,
-			);
+			const text = (result.choices[0]?.message?.content ?? "").trim();
+			if (!text || /^done$/i.test(text)) return [];
+			return text
+				.split("\n")
+				.map((l) => l.replace(/^[\s\-*•·\d.]+/, "").trim())
+				.filter((l) => l.length > 3)
+				.slice(0, maxAdditional);
+		} catch {
+			return [];
 		}
 	}
 

@@ -117,14 +117,13 @@ export default createEvent({
 			// Preparamos el prompt. Si hay contenido directo lo usamos; si la mención
 			// vino sin texto, buscamos los últimos mensajes del usuario como contexto.
 			let promptMessages: string[];
-			let needsResearch = false;
+			// Para preguntas con sustancia, el modelo dentro de researchMultiple
+			// decide por sí mismo si investigar (0 queries = no investiga) y cuánto.
+			const shouldResearch =
+				cleanContent.length > 0 && aiService.classify(cleanContent) === "BUENA";
 
 			if (cleanContent.length > 0) {
 				promptMessages = [`${message.author.username}: ${cleanContent}`];
-				// Clasificamos con el modelo solo si la pregunta tiene sustancia mínima
-				if (aiService.classify(cleanContent) === "BUENA") {
-					needsResearch = await aiService.classifyNeedsResearch(cleanContent);
-				}
 			} else {
 				const prevMessages = await aiService.getLatestMessages(
 					client,
@@ -152,7 +151,7 @@ export default createEvent({
 				: undefined;
 
 			try {
-				const webResult = needsResearch
+				const webResult = shouldResearch
 					? await webResearchService.researchMultiple(cleanContent, onProgress)
 					: null;
 
