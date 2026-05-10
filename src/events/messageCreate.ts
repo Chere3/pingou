@@ -117,10 +117,10 @@ export default createEvent({
 			// Preparamos el prompt. Si hay contenido directo lo usamos; si la mención
 			// vino sin texto, buscamos los últimos mensajes del usuario como contexto.
 			let promptMessages: string[];
-			// Para preguntas con sustancia, el modelo dentro de researchMultiple
-			// decide por sí mismo si investigar (0 queries = no investiga) y cuánto.
-			const shouldResearch =
-				cleanContent.length > 0 && aiService.classify(cleanContent) === "BUENA";
+			// El modelo dentro de researchMultiple decide por sí mismo si investigar
+			// (0 queries = no investiga) y cuántas búsquedas hacer. Solo verificamos
+			// que haya contenido mínimo para no llamar al modelo en menciones vacías.
+			const shouldResearch = cleanContent.length >= 4;
 
 			if (cleanContent.length > 0) {
 				promptMessages = [`${message.author.username}: ${cleanContent}`];
