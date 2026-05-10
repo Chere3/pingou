@@ -151,9 +151,28 @@ export default createEvent({
 				: undefined;
 
 			try {
-				const webResult = shouldResearch
-					? await webResearchService.researchMultiple(cleanContent, onProgress)
-					: null;
+				let webResult: Awaited<
+					ReturnType<typeof webResearchService.researchMultiple>
+				> = null;
+				if (shouldResearch) {
+					// Rate limit: máx 2 investigaciones por minuto por usuario
+					const slot = await cooldownService.claimRateLimitSlot(
+						userId,
+						"ai-research",
+						2,
+						60,
+					);
+					if (slot.ok) {
+						webResult = await webResearchService.researchMultiple(
+							cleanContent,
+							onProgress,
+						);
+					} else {
+						await onProgress?.(
+							`⏳ Límite de investigación alcanzado (2/min). Respondiendo sin contexto web — espera **${slot.retryAfter}s** para volver a buscar.`,
+						);
+					}
+				}
 
 				const { text, usage } = await aiService.chat(
 					promptMessages,
