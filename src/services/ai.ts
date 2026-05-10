@@ -136,10 +136,38 @@ export class AIService {
 	}
 
 	/**
+	 * Parser tolerante de JSON desde respuestas de modelos: maneja code fences,
+	 * preámbulos tipo "Sure, here are the queries:", y comas finales. Intenta
+	 * un parse limpio, luego extrae el primer bloque JSON con regex como
+	 * fallback. Devuelve null si no logra parsear.
+	 */
+	private parseLooseJson<T>(raw: string): T | null {
+		const cleaned = raw
+			.trim()
+			.replace(/^```(?:json)?\s*/i, "")
+			.replace(/\s*```$/i, "")
+			.trim();
+		try {
+			return JSON.parse(cleaned) as T;
+		} catch {}
+		// Fallback: extraer el primer objeto/array JSON balanceado
+		const match = cleaned.match(/[[{][\s\S]*[\]}]/);
+		if (!match) return null;
+		try {
+			return JSON.parse(match[0]) as T;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
 	 * Decide si la pregunta necesita investigación web y, de ser así, genera
 	 * 1-3 queries iniciales óptimas. Devuelve [] si el modelo considera que
 	 * no hace falta buscar (concepto básico, saludo, pregunta sin contexto
 	 * técnico específico, etc.). Falla silenciosamente devolviendo [query].
+	 *
+	 * Usa JSON schema mode (`response_format: { type: "json_object" }`) para
+	 * parseo robusto en vez del split-by-newline regex previo.
 	 */
 	async generateSearchQueries(query: string): Promise<string[]> {
 		if (!process.env.AI_API_KEY) return [query];
@@ -147,31 +175,31 @@ export class AIService {
 		try {
 			const result = await this.ai.chat.completions.create({
 				model: this.model,
-				max_tokens: 80,
+				max_tokens: 120,
 				temperature: 0,
+				response_format: { type: "json_object" },
 				messages: [
 					{
 						role: "system",
-						content: `Decides si una pregunta de programación necesita búsqueda web.
+						content: `Decides si una pregunta de programación necesita búsqueda web y, si la necesita, generás 2-3 queries en inglés.
 
-Responde 'NONE' EXCLUSIVAMENTE en estos 3 casos:
+Responde SIEMPRE con un objeto JSON con esta forma exacta:
+{ "needs_research": boolean, "queries": string[] }
+
+needs_research = false EXCLUSIVAMENTE en estos 3 casos (en ese caso queries = []):
 1. Saludos o charla: "hola", "buenos días", "cómo estás"
-2. Conceptos GENÉRICOS de la disciplina (sin nombres propios): "qué es una variable", "qué es un bucle", "qué es una función"
+2. Conceptos GENÉRICOS de la disciplina (sin nombres propios): "qué es una variable", "qué es un bucle"
 3. Pedidos de opinión personal sin tema concreto: "cuál es mejor lenguaje?"
 
-Para TODO lo demás, genera 2-3 queries.
+Para TODO lo demás needs_research = true con 2-3 queries en inglés.
 
-REGLA CRÍTICA ANTI-ALUCINACIÓN: si la pregunta contiene un nombre propio (proyecto, librería, herramienta, framework, comando, sigla, paquete npm/pip, etc.) NUNCA asumas que sabes qué es. Tu conocimiento puede ser incorrecto, estar desactualizado, o el nombre puede ser ambiguo. SIEMPRE investiga, sin excepciones.
+REGLA CRÍTICA ANTI-ALUCINACIÓN: si la pregunta contiene un nombre propio (proyecto, librería, herramienta, framework, comando, sigla, paquete npm/pip), NUNCA asumas que sabes qué es. SIEMPRE investiga.
 
 Ejemplos:
-- "qué es openclaw" → INVESTIGA (nombre propio desconocido) → ["openclaw github", "openclaw project what is"]
-- "qué es bun" → INVESTIGA (puede ser muchas cosas) → ["bun javascript runtime", "bun.sh what is"]
-- "TypeError: Cannot read..." → INVESTIGA → ["TypeError Cannot read properties of undefined fix"]
-- "cómo uso useState" → INVESTIGA → ["React useState hook tutorial"]
-- "hola" → NONE
-- "qué es una variable" → NONE (concepto genérico)
-
-FORMATO: solo las queries en inglés, una por línea, sin numeración, sin texto extra.`,
+- "qué es openclaw" → { "needs_research": true, "queries": ["openclaw github project", "openclaw what is", "openclaw captain claw remake"] }
+- "TypeError: Cannot read properties of undefined" → { "needs_research": true, "queries": ["TypeError Cannot read properties of undefined fix javascript", "javascript undefined property access error"] }
+- "hola" → { "needs_research": false, "queries": [] }
+- "qué es una variable" → { "needs_research": false, "queries": [] }`,
 					},
 					{
 						role: "user",
@@ -179,14 +207,22 @@ FORMATO: solo las queries en inglés, una por línea, sin numeración, sin texto
 					},
 				],
 			});
-			const text = (result.choices[0]?.message?.content ?? "").trim();
-			if (!text || /^none$/i.test(text)) return [];
-			const lines = text
-				.split("\n")
-				.map((l) => l.replace(/^[\s\-*•·\d.]+/, "").trim())
-				.filter((l) => l.length > 3)
+			const raw = result.choices[0]?.message?.content ?? "";
+			const parsed = this.parseLooseJson<{
+				needs_research?: boolean;
+				queries?: unknown;
+			}>(raw);
+
+			if (!parsed || parsed.needs_research === false) return [];
+			if (!Array.isArray(parsed.queries)) return [query];
+
+			const queries = parsed.queries
+				.filter(
+					(q): q is string => typeof q === "string" && q.trim().length > 3,
+				)
+				.map((q) => q.trim())
 				.slice(0, 3);
-			return lines.length > 0 ? lines : [query];
+			return queries.length ? queries : [query];
 		} catch {
 			return [query];
 		}
