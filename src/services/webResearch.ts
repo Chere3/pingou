@@ -117,8 +117,14 @@ class WebResearchService {
 
 			await onProgress?.(`🔍 Búsqueda ${queriesRun}: \`${searchQuery}\`...`);
 
-			const searchResult = await this.searchDDGLite(searchQuery, 2);
-			const newUrl = searchResult?.urls.find((u) => !seenUrls.has(u));
+			// Pedimos hasta 5 URLs del SERP, filtramos las ya extraídas
+			// (cross-round dedup estilo Perplexica alreadyExtractedURLs) y
+			// dejamos que el picker del modelo elija la mejor por
+			// relevancia + reputación de dominio.
+			const searchResult = await this.searchDDGLite(searchQuery, 5);
+			const candidates =
+				searchResult?.urls.filter((u) => !seenUrls.has(u)) ?? [];
+			const newUrl = await aiService.pickBestUrl(query, candidates);
 
 			if (newUrl) {
 				seenUrls.add(newUrl);

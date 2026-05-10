@@ -316,6 +316,71 @@ ${contentSummary}${previousQueriesBlock}
 		}
 	}
 
+	/**
+	 * Picker estilo Perplexica baseSearch.ts pickerPrompt: dado una pregunta
+	 * y una lista numerada de URLs candidatas, devuelve el índice de la URL
+	 * con mejor combinación de relevancia + reputación de dominio + diversidad
+	 * (evitar duplicados temáticos).
+	 *
+	 * Reemplaza al "primer URL no visto" del SERP por una elección informada.
+	 * Si hay 0-1 candidatos no hay nada que elegir; si hay 2+ se hace la
+	 * llamada al modelo. Falla devolviendo el primer candidato (fallback
+	 * equivalente al comportamiento anterior).
+	 */
+	async pickBestUrl(
+		query: string,
+		candidates: string[],
+	): Promise<string | null> {
+		if (!candidates.length) return null;
+		if (candidates.length === 1) return candidates[0] ?? null;
+		if (!process.env.AI_API_KEY) return candidates[0] ?? null;
+
+		const numbered = candidates.map((url, i) => `${i}. ${url}`).join("\n");
+
+		try {
+			const result = await this.ai.chat.completions.create({
+				model: this.model,
+				max_tokens: 60,
+				temperature: 0,
+				response_format: { type: "json_object" },
+				messages: [
+					{
+						role: "system",
+						content: `Sos un evaluador de fuentes web. Recibís una pregunta y una lista numerada de URLs candidatas. Elegí la URL MÁS PROBABLEMENTE útil para responder, considerando:
+
+1. Relevancia: el dominio/path sugiere que el contenido aborda la pregunta
+2. Reputación: docs oficiales > github oficial > stackoverflow > MDN/devdocs > blogs técnicos conocidos > blogs random > spam/clickbait
+3. Especificidad: paths que mencionan el tema concreto > home pages genéricas
+
+Responde con JSON: { "pick": <índice numérico> }`,
+					},
+					{
+						role: "user",
+						content: `Pregunta: "${query.slice(0, 200)}"
+
+Candidatos:
+${numbered}`,
+					},
+				],
+			});
+			const raw = result.choices[0]?.message?.content ?? "";
+			const parsed = this.parseLooseJson<{ pick?: number }>(raw);
+			const idx = parsed?.pick;
+
+			if (
+				typeof idx === "number" &&
+				Number.isInteger(idx) &&
+				idx >= 0 &&
+				idx < candidates.length
+			) {
+				return candidates[idx] ?? null;
+			}
+			return candidates[0] ?? null;
+		} catch {
+			return candidates[0] ?? null;
+		}
+	}
+
 	async chat(
 		messages: string[],
 		webContext?: string,
