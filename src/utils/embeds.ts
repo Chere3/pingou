@@ -71,24 +71,15 @@ export const Embeds = {
 		// Discord limita el footer a 2048 chars
 		const safeFooter = footerText.slice(0, 2048);
 
-		// El footer y las fuentes van en el PRIMER chunk porque ese es el que
-		// reemplaza al embed de "💭 Procesando..." y queda como mensaje principal.
-		// Los chunks siguientes son continuaciones y no necesitan metadata.
+		// El footer va en el PRIMER chunk porque ese es el que reemplaza al
+		// embed de "💭 Procesando..." y queda como mensaje principal. Los
+		// chunks siguientes son continuaciones y no necesitan metadata. La
+		// lista expandida de fuentes ya no va inline en un field — se accede
+		// vía botón "📚 Ver fuentes" (componente aiSourceButton) que abre un
+		// mensaje ephemeral, manteniendo el embed principal limpio.
 		return chunks.map((chunk, i) => {
 			const embed = new Embed().setDescription(chunk).setColor("Blue");
-			if (i === 0) {
-				embed.setFooter({ text: safeFooter });
-				if (urls.length > 1) {
-					const fieldValue = urls
-						.map((u, j) => `${j + 1}. ${u}`)
-						.join("\n")
-						.slice(0, 1024);
-					embed.addFields({
-						name: "📚 Fuentes consultadas",
-						value: fieldValue,
-					});
-				}
-			}
+			if (i === 0) embed.setFooter({ text: safeFooter });
 			return embed;
 		});
 	},

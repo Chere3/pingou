@@ -1,10 +1,38 @@
-import { Embed, type Message, type UsingClient } from "seyfert";
-import type { APIEmbed } from "seyfert/lib/types";
+import { randomUUID } from "node:crypto";
+import {
+	ActionRow,
+	Button,
+	Embed,
+	type Message,
+	type UsingClient,
+} from "seyfert";
+import { type APIEmbed, ButtonStyle } from "seyfert/lib/types";
 import { CONFIG } from "@/config";
 import { aiService } from "@/services/ai";
+import { aiSourcesStore } from "@/services/aiSources";
 import { cooldownService } from "@/services/cooldown";
 import { webResearchService } from "@/services/webResearch";
 import { Embeds } from "@/utils/embeds";
+
+/**
+ * Construye un ActionRow con el botón "📚 Ver fuentes (N)" cuando hay 2+
+ * fuentes. Guarda las URLs en el store en memoria con TTL y embebe el key
+ * en el customId. Con 1 sola fuente devuelve undefined porque el footer
+ * del embed ya muestra la URL directa.
+ */
+function buildSourcesRow(
+	sourceUrls: string[] | undefined,
+): ActionRow<Button> | undefined {
+	if (!sourceUrls || sourceUrls.length < 2) return undefined;
+	const key = randomUUID().slice(0, 8);
+	aiSourcesStore.save(key, sourceUrls);
+	return new ActionRow<Button>().setComponents([
+		new Button()
+			.setCustomId(`ai-sources:${key}`)
+			.setLabel(`📚 Ver fuentes (${sourceUrls.length})`)
+			.setStyle(ButtonStyle.Secondary),
+	]);
+}
 
 /**
  * Maneja menciones al bot (@Pingou ...) con respuesta de IA, investigación
@@ -149,25 +177,44 @@ export async function handleAiMention(
 		webResult?.sourceUrls,
 	);
 
+	// Botón "📚 Ver fuentes" cuando hay 2+ fuentes (con 1 sola el footer ya
+	// la muestra directo). Va en el ÚLTIMO chunk para que el usuario lo
+	// encuentre al terminar de leer la respuesta.
+	const sourcesRow = buildSourcesRow(webResult?.sourceUrls);
+	const components = sourcesRow ? [sourcesRow] : undefined;
+
 	const [firstEmbed, ...restEmbeds] = embeds;
 	if (statusMsg && firstEmbed) {
+		// Para respuestas single-chunk, el "último embed" es el primero (el
+		// editado del statusMsg). Solo en ese caso le adjuntamos los components
+		// al edit. Si hay restEmbeds, el row va en el último reply.
+		const firstIsLast = !restEmbeds.length;
 		await client.messages
 			.edit(statusMsg.id, statusMsg.channelId, {
 				embeds: [firstEmbed as APIEmbed],
+				...(firstIsLast && components ? { components } : {}),
 			})
 			.catch((err) =>
 				console.error("Error editing AI reply status embed:", err),
 			);
-		for (const embed of restEmbeds) {
+		for (const [i, embed] of restEmbeds.entries()) {
+			const isLast = i === restEmbeds.length - 1;
 			await message
-				.reply({ embeds: [embed] })
+				.reply({
+					embeds: [embed],
+					...(isLast && components ? { components } : {}),
+				})
 				.catch((err) => console.error("Error sending AI reply chunk:", err));
 		}
 	} else {
 		// Mención sin texto — o el statusMsg falló al crearse — replicamos todo
-		for (const embed of embeds) {
+		for (const [i, embed] of embeds.entries()) {
+			const isLast = i === embeds.length - 1;
 			await message
-				.reply({ embeds: [embed] })
+				.reply({
+					embeds: [embed],
+					...(isLast && components ? { components } : {}),
+				})
 				.catch((err) => console.error("Error sending AI reply:", err));
 		}
 	}
