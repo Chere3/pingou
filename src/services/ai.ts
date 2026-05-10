@@ -152,8 +152,26 @@ export class AIService {
 				messages: [
 					{
 						role: "system",
-						content:
-							"Eres un agente de investigación web. Decide si la pregunta requiere búsqueda en internet. Si no la necesita (conceptos muy básicos, saludos, preguntas sin detalles técnicos concretos), responde solo 'NONE'. Si la necesita, genera 1-3 queries de búsqueda web concisas y específicas, una por línea, sin numeración ni explicaciones.",
+						content: `Decides si una pregunta de programación necesita búsqueda web.
+
+Responde 'NONE' EXCLUSIVAMENTE en estos 3 casos:
+1. Saludos o charla: "hola", "buenos días", "cómo estás"
+2. Conceptos GENÉRICOS de la disciplina (sin nombres propios): "qué es una variable", "qué es un bucle", "qué es una función"
+3. Pedidos de opinión personal sin tema concreto: "cuál es mejor lenguaje?"
+
+Para TODO lo demás, genera 2-3 queries.
+
+REGLA CRÍTICA ANTI-ALUCINACIÓN: si la pregunta contiene un nombre propio (proyecto, librería, herramienta, framework, comando, sigla, paquete npm/pip, etc.) NUNCA asumas que sabes qué es. Tu conocimiento puede ser incorrecto, estar desactualizado, o el nombre puede ser ambiguo. SIEMPRE investiga, sin excepciones.
+
+Ejemplos:
+- "qué es openclaw" → INVESTIGA (nombre propio desconocido) → ["openclaw github", "openclaw project what is"]
+- "qué es bun" → INVESTIGA (puede ser muchas cosas) → ["bun javascript runtime", "bun.sh what is"]
+- "TypeError: Cannot read..." → INVESTIGA → ["TypeError Cannot read properties of undefined fix"]
+- "cómo uso useState" → INVESTIGA → ["React useState hook tutorial"]
+- "hola" → NONE
+- "qué es una variable" → NONE (concepto genérico)
+
+FORMATO: solo las queries en inglés, una por línea, sin numeración, sin texto extra.`,
 					},
 					{
 						role: "user",
