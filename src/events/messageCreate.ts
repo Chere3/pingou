@@ -155,22 +155,30 @@ export default createEvent({
 					ReturnType<typeof webResearchService.researchMultiple>
 				> = null;
 				if (shouldResearch) {
-					// Rate limit: máx 2 investigaciones por minuto por usuario
-					const slot = await cooldownService.claimRateLimitSlot(
-						userId,
-						"ai-research",
-						2,
-						60,
-					);
-					if (slot.ok) {
-						webResult = await webResearchService.researchMultiple(
-							cleanContent,
-							onProgress,
+					// Primero el modelo decide si vale la pena investigar (gratis: no
+					// cuesta slot ni red). Solo si devuelve queries reales reclamamos
+					// un slot del rate limit y arrancamos el loop de búsqueda.
+					const initialQueries =
+						await aiService.generateSearchQueries(cleanContent);
+
+					if (initialQueries.length > 0) {
+						const slot = await cooldownService.claimRateLimitSlot(
+							userId,
+							"ai-research",
+							2,
+							60,
 						);
-					} else {
-						await onProgress?.(
-							`⏳ Límite de investigación alcanzado (2/min). Respondiendo sin contexto web — espera **${slot.retryAfter}s** para volver a buscar.`,
-						);
+						if (slot.ok) {
+							webResult = await webResearchService.researchMultiple(
+								cleanContent,
+								initialQueries,
+								onProgress,
+							);
+						} else {
+							await onProgress?.(
+								`⏳ Límite de investigación alcanzado (2/min). Respondiendo sin contexto web — espera **${slot.retryAfter}s** para volver a buscar.`,
+							);
+						}
 					}
 				}
 

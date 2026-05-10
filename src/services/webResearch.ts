@@ -10,8 +10,7 @@ class WebResearchService {
 	private readonly JINA_BASE = "https://r.jina.ai/";
 	private readonly FETCH_TIMEOUT_MS = 8_000;
 	private readonly MAX_QUERIES = 5;
-	private readonly MAX_CONTENT_CHARS = 3_000;
-	private readonly MAX_CONTENT_CHARS_MULTI = 1_500;
+	private readonly MAX_CONTENT_CHARS = 1_500;
 
 	private async fetchWithTimeout(
 		url: string,
@@ -88,28 +87,25 @@ class WebResearchService {
 	}
 
 	/**
-	 * Loop adaptativo de investigación web. El modelo genera las queries
-	 * iniciales (0-3) y evalúa tras cada ronda si necesita buscar más
-	 * (0-N adicionales). Se detiene cuando el modelo está satisfecho o se
-	 * alcanzan MAX_QUERIES (5) en total.
+	 * Loop adaptativo de investigación web. Recibe las queries iniciales
+	 * (ya generadas por el modelo, típicamente vía aiService.generateSearchQueries)
+	 * y evalúa tras cada ronda si necesita buscar más (0-N adicionales).
+	 * Se detiene cuando el modelo está satisfecho o se alcanzan MAX_QUERIES (5).
 	 *
-	 * Si generateSearchQueries devuelve [] el modelo decidió que no hace
-	 * falta investigar — se retorna null directamente.
+	 * El call site es quien decide si investigar (consultando al modelo) y reclama
+	 * recursos como rate-limit antes de llamar acá. Esto evita que decisiones del
+	 * modelo de "no investigar" gasten slots de rate limit u otros recursos.
 	 */
 	async researchMultiple(
 		query: string,
+		initialQueries: string[],
 		onProgress?: (description: string) => Promise<void>,
 	): Promise<ResearchResult | null> {
+		if (initialQueries.length === 0) return null;
 		const seenUrls = new Set<string>();
 		const sources: { url: string; content: string }[] = [];
 		let queriesRun = 0;
-
-		// El modelo decide si investigar y genera las queries iniciales
-		await onProgress?.("🤔 Decidiendo qué investigar...");
-		const pending = await aiService.generateSearchQueries(query);
-
-		// [] = modelo decidió que no necesita investigación
-		if (pending.length === 0) return null;
+		const pending = [...initialQueries];
 
 		// Loop adaptativo: corre queries, evalúa resultados, repite si hace falta
 		while (pending.length > 0 && queriesRun < this.MAX_QUERIES) {
@@ -126,7 +122,7 @@ class WebResearchService {
 				seenUrls.add(newUrl);
 				const content = await this.fetchMarkdown(
 					newUrl,
-					this.MAX_CONTENT_CHARS_MULTI,
+					this.MAX_CONTENT_CHARS,
 				);
 				if (content?.trim()) {
 					sources.push({ url: newUrl, content });
@@ -164,29 +160,6 @@ class WebResearchService {
 			sourceUrl: sourceUrls.at(0) ?? "",
 			sourceUrls,
 		};
-	}
-
-	/**
-	 * Búsqueda simple (sin progreso en vivo). Usa la primera query generada
-	 * por el modelo y lee la primera URL con Jina Reader.
-	 */
-	async research(query: string): Promise<ResearchResult | null> {
-		const queries = await aiService.generateSearchQueries(query);
-		if (queries.length === 0) return null;
-		const searchResult = await this.searchDDGLite(queries[0] ?? query, 1);
-		const url = searchResult?.urls[0];
-		if (!url) return null;
-
-		const content = await this.fetchMarkdown(url, this.MAX_CONTENT_CHARS);
-		if (!content?.trim()) return null;
-
-		const contextForAI = [
-			`[Contexto obtenido de internet — fuente: ${url}]`,
-			content,
-			"[Fin del contexto web]",
-		].join("\n\n");
-
-		return { contextForAI, sourceUrl: url };
 	}
 }
 

@@ -76,11 +76,13 @@ export const Embeds = {
 		// Discord limita el footer a 2048 chars
 		const safeFooter = footerText.slice(0, 2048);
 
+		// El footer y las fuentes van en el PRIMER chunk porque ese es el que
+		// reemplaza al embed de "💭 Procesando..." y queda como mensaje principal.
+		// Los chunks siguientes son continuaciones y no necesitan metadata.
 		return chunks.map((chunk, i) => {
 			const embed = new Embed().setDescription(chunk).setColor("Blue");
-			if (i === chunks.length - 1) {
+			if (i === 0) {
 				embed.setFooter({ text: safeFooter });
-				// Si hay múltiples fuentes las listamos en un field (máx 1024 chars)
 				if (urls.length > 1) {
 					const fieldValue = urls
 						.map((u, j) => `${j + 1}. ${u}`)
