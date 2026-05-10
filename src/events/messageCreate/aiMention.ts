@@ -1,5 +1,6 @@
 import { Embed, type Message, type UsingClient } from "seyfert";
 import type { APIEmbed } from "seyfert/lib/types";
+import { CONFIG } from "@/config";
 import { aiService } from "@/services/ai";
 import { cooldownService } from "@/services/cooldown";
 import { webResearchService } from "@/services/webResearch";
@@ -68,7 +69,9 @@ export async function handleAiMention(
 	// El modelo dentro de researchMultiple decide por sí mismo si investigar
 	// (0 queries = no investiga) y cuántas búsquedas hacer. Solo verificamos
 	// que haya contenido mínimo para no llamar al modelo en menciones vacías.
-	const shouldResearch = cleanContent.length >= 4;
+	// El feature flag CONFIG.AI.RESEARCH_ENABLED permite desactivar todo el
+	// módulo de investigación web sin tocar el código.
+	const shouldResearch = CONFIG.AI.RESEARCH_ENABLED && cleanContent.length >= 4;
 
 	if (cleanContent.length > 0) {
 		promptMessages = [`${message.author.username}: ${cleanContent}`];
