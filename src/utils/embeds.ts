@@ -50,6 +50,7 @@ export const Embeds = {
 		reply: string,
 		usage?: CompletionUsage,
 		sourceUrl?: string,
+		sourceUrls?: string[],
 	): Embed[] {
 		const chunks = this.chunkText(reply, 4000);
 		const input = usage?.prompt_tokens ?? 0;
@@ -59,14 +60,37 @@ export const Embeds = {
 			? `Respuesta IA | I: ${input} | O: ${output}`
 			: "Respuesta IA";
 
-		if (sourceUrl) {
-			footerText += ` | 🔍 ${sourceUrl}`;
+		const urls =
+			sourceUrls && sourceUrls.length > 0
+				? sourceUrls
+				: sourceUrl
+					? [sourceUrl]
+					: [];
+
+		if (urls.length === 1) {
+			footerText += ` | 🔍 ${urls[0]}`;
+		} else if (urls.length > 1) {
+			footerText += ` | 🔍 ${urls.length} fuentes`;
 		}
+
+		// Discord limita el footer a 2048 chars
+		const safeFooter = footerText.slice(0, 2048);
 
 		return chunks.map((chunk, i) => {
 			const embed = new Embed().setDescription(chunk).setColor("Blue");
 			if (i === chunks.length - 1) {
-				embed.setFooter({ text: footerText });
+				embed.setFooter({ text: safeFooter });
+				// Si hay múltiples fuentes las listamos en un field (máx 1024 chars)
+				if (urls.length > 1) {
+					const fieldValue = urls
+						.map((u, j) => `${j + 1}. ${u}`)
+						.join("\n")
+						.slice(0, 1024);
+					embed.addFields({
+						name: "📚 Fuentes consultadas",
+						value: fieldValue,
+					});
+				}
 			}
 			return embed;
 		});

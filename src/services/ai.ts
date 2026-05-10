@@ -47,15 +47,19 @@ export type Features = {
 };
 
 export class AIService {
-	private readonly memory = new Map<string, string[]>();
-	private readonly ai: OpenAI;
+	private _ai: OpenAI | null = null;
 	private readonly model: string = "qwen/qwen3-coder-480b-a35b-instruct";
 
-	constructor() {
-		this.ai = new OpenAI({
-			apiKey: process.env.AI_API_KEY,
-			baseURL: "https://integrate.api.nvidia.com/v1",
-		});
+	// Instanciamos el cliente de forma lazy para que la falta de AI_API_KEY
+	// no rompa la carga del módulo y solo falle al intentar usar la IA.
+	private get ai(): OpenAI {
+		if (!this._ai) {
+			this._ai = new OpenAI({
+				apiKey: process.env.AI_API_KEY,
+				baseURL: "https://integrate.api.nvidia.com/v1",
+			});
+		}
+		return this._ai;
 	}
 
 	extractFeatures(text: string): Features {
@@ -131,12 +135,45 @@ export class AIService {
 		}
 	}
 
-	saveToMemory(id: string, messages: string[]) {
-		this.memory.set(id, messages);
-	}
-
-	getFromMemory(id: string) {
-		return this.memory.get(id);
+	/**
+	 * Usa el modelo para decidir si la pregunta requiere búsqueda web.
+	 * Mucho más preciso que heurísticas de regex. Falla silenciosamente
+	 * devolviendo `false` si no hay clave o hay error de red.
+	 */
+	async classifyNeedsResearch(query: string): Promise<boolean> {
+		if (!process.env.AI_API_KEY || query.length < 10) return false;
+		// Truncamos para no enviar queries enormes al clasificador
+		const truncated = query.slice(0, 400);
+		try {
+			const result = await this.ai.chat.completions.create({
+				model: this.model,
+				max_tokens: 5,
+				temperature: 0,
+				messages: [
+					{
+						role: "system",
+						content:
+							"Eres un clasificador binario. Responde ÚNICAMENTE con 'SI' o 'NO', sin explicaciones ni puntuación.",
+					},
+					{
+						role: "user",
+						content: `¿Esta pregunta de programación se beneficia de buscar documentación o información actualizada en internet (errores específicos, versiones, APIs, librerías)?\n\nPregunta: "${truncated}"\n\nResponde solo SI o NO.`,
+					},
+				],
+			});
+			const ans = (result.choices[0]?.message?.content ?? "")
+				.trim()
+				.toUpperCase();
+			return (
+				ans.startsWith("SI") || ans.startsWith("SÍ") || ans.startsWith("YES")
+			);
+		} catch (err) {
+			// Fallback a heurística ligera si el modelo no está disponible
+			console.error("classifyNeedsResearch fallback:", err);
+			return /error|exception|bug|undefined|cannot|typeerror|cómo|como\s|how\s|versión|version|v\d+\.\d+|\bapi\b/i.test(
+				query,
+			);
+		}
 	}
 
 	async chat(
@@ -185,12 +222,12 @@ export class AIService {
 					"Ahora no puedo responder a esta pregunta.",
 				usage: result.usage ?? undefined,
 			};
-		} catch (error: any) {
+		} catch (error) {
 			console.error("OpenAI API error:", error);
 
 			const errorStr = JSON.stringify(error);
 			const isRateLimit =
-				error?.status === 429 ||
+				(error as { status?: number })?.status === 429 ||
 				errorStr.includes("rate limit") ||
 				errorStr.includes("quota");
 

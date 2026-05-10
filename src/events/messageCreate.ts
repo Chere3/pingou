@@ -1,5 +1,5 @@
 import { ActionRow, Button, createEvent, Embed } from "seyfert";
-import { ButtonStyle } from "seyfert/lib/types";
+import { type APIEmbed, ButtonStyle } from "seyfert/lib/types";
 import { CONFIG } from "@/config";
 import { pendingRepRepository } from "@/repositories/pendingRepRepository";
 import { aiService } from "@/services/ai";
@@ -27,12 +27,28 @@ function containsThanks(text: string): boolean {
 export default createEvent({
 	data: { once: false, name: "messageCreate" },
 	async run(message, client) {
+		// Ignorar bots y Disboard primero para no procesar innecesariamente
 		if (message.author.id === CONFIG.OTHER.DISBOARD_ID) {
 			await bumpService.handleBump(message);
 			return;
 		}
 
 		if (message.author.bot) return;
+
+		// Meme reactions — después del bot check para no reaccionar a bots
+		if (
+			CONFIG.CHANNELS.MEMES &&
+			message.channelId === CONFIG.CHANNELS.MEMES &&
+			CONFIG.MEMES_REACTIONS.length
+		) {
+			await Promise.all(
+				CONFIG.MEMES_REACTIONS.map((emoji) =>
+					client.reactions
+						.add(message.id, message.channelId, emoji)
+						.catch(() => {}),
+				),
+			);
+		}
 
 		// Auto-thread en canales configurados
 		const autoChannels = CONFIG.AUTO_THREAD_CHANNELS.filter(Boolean);
@@ -87,28 +103,28 @@ export default createEvent({
 				contextLimit = Math.min(Number.parseInt(match[1], 10), 10);
 			}
 
-			// Solo investigamos si la pregunta es "BUENA" y tiene señales de que
-			// necesita info externa (tecnologías, errores, versiones, etc.)
-			const isGoodQuestion = aiService.classify(cleanContent) === "BUENA";
-			const needsResearch =
-				isGoodQuestion && webResearchService.shouldResearch(cleanContent);
+			// Mostramos "Procesando..." inmediatamente para preguntas con contenido,
+			// así el usuario sabe que el bot está trabajando mientras clasifica.
+			const statusMsg =
+				cleanContent.length > 0
+					? await message.reply({
+							embeds: [
+								new Embed().setDescription("💭 Procesando...").setColor("Blue"),
+							],
+						})
+					: null;
 
-			// Enviamos el estado de investigación de inmediato para que el usuario
-			// sepa que estamos trabajando en ello. Lo editaremos con la respuesta final.
-			const statusMsg = needsResearch
-				? await message.reply({
-						embeds: [
-							new Embed()
-								.setDescription("🔍 Investigando en internet...")
-								.setColor("Yellow"),
-						],
-					})
-				: null;
-
+			// Preparamos el prompt. Si hay contenido directo lo usamos; si la mención
+			// vino sin texto, buscamos los últimos mensajes del usuario como contexto.
 			let promptMessages: string[];
+			let needsResearch = false;
 
 			if (cleanContent.length > 0) {
 				promptMessages = [`${message.author.username}: ${cleanContent}`];
+				// Clasificamos con el modelo solo si la pregunta tiene sustancia mínima
+				if (aiService.classify(cleanContent) === "BUENA") {
+					needsResearch = await aiService.classifyNeedsResearch(cleanContent);
+				}
 			} else {
 				const prevMessages = await aiService.getLatestMessages(
 					client,
@@ -116,18 +132,29 @@ export default createEvent({
 					contextLimit + 1,
 					message.author.id,
 				);
-				if (!prevMessages) return;
+				if (!prevMessages.length) return;
 				promptMessages = [...prevMessages]
 					.reverse()
 					.map((m) => `${m.author.username}: ${m.content ?? ""}`);
 			}
 
+			// Callback que edita el embed en vivo con el progreso de la investigación
+			const onProgress = statusMsg
+				? async (description: string) => {
+						await client.messages
+							.edit(statusMsg.id, statusMsg.channelId, {
+								embeds: [
+									new Embed().setDescription(description).setColor("Yellow"),
+								],
+							})
+							.catch(() => {});
+					}
+				: undefined;
+
 			try {
-				// Run web research and message preparation concurrently so the
-				// fetch latency doesn't block building the prompt context.
-				const [webResult] = await Promise.all([
-					needsResearch ? webResearchService.research(cleanContent) : null,
-				]);
+				const webResult = needsResearch
+					? await webResearchService.researchMultiple(cleanContent, onProgress)
+					: null;
 
 				const { text, usage } = await aiService.chat(
 					promptMessages,
@@ -136,18 +163,22 @@ export default createEvent({
 
 				await cooldownService.setCooldown(userId, cooldownKey, 15);
 
-				const embeds = Embeds.aiReplyEmbeds(text, usage, webResult?.sourceUrl);
+				const embeds = Embeds.aiReplyEmbeds(
+					text,
+					usage,
+					webResult?.sourceUrl,
+					webResult?.sourceUrls,
+				);
 
 				if (statusMsg) {
-					// Replace the "Investigando…" status with the first AI embed.
 					await client.messages.edit(statusMsg.id, statusMsg.channelId, {
-						embeds: [embeds[0]],
+						embeds: [embeds[0] as APIEmbed],
 					});
-					// Any overflow chunks (very long responses) go as separate replies.
 					for (const embed of embeds.slice(1)) {
 						await message.reply({ embeds: [embed] });
 					}
 				} else {
+					// Mención sin texto — usó contexto de mensajes previos
 					for (const embed of embeds) {
 						await message.reply({ embeds: [embed] });
 					}
@@ -158,15 +189,13 @@ export default createEvent({
 					"Error de IA",
 					"Ocurrió un error al procesar tu pregunta. Por favor, intentá más tarde.",
 				);
-				if (statusMsg) {
-					await client.messages
-						.edit(statusMsg.id, statusMsg.channelId, {
-							embeds: [errorEmbed],
-						})
-						.catch(() => message.reply({ embeds: [errorEmbed] }));
-				} else {
-					await message.reply({ embeds: [errorEmbed] });
-				}
+				await (statusMsg
+					? client.messages
+							.edit(statusMsg.id, statusMsg.channelId, {
+								embeds: [errorEmbed],
+							})
+							.catch(() => message.reply({ embeds: [errorEmbed] }))
+					: message.reply({ embeds: [errorEmbed] }));
 			}
 			return;
 		}
@@ -190,11 +219,8 @@ export default createEvent({
 			if (!channel) return;
 
 			const allowed =
-				// Canal explícitamente permitido
 				channel.id === CONFIG.CHANNELS.CHAT_PROGRAMADORES ||
-				// Texto directo bajo la categoría FOROS
 				channel.parentId === CONFIG.CATEGORIES.FORUMS ||
-				// Thread de un canal foro que está bajo la categoría FOROS
 				(channel.parentId
 					? await client.channels
 							.fetch(channel.parentId)
