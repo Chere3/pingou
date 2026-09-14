@@ -4,9 +4,10 @@ import { CONFIG } from "@/config";
 const URL_REGEX = /https?:\/\/[^\s]+/i;
 
 function hasAttachmentOrLink(message: Message): boolean {
-	if (message.attachments?.length) return true;
+	/* if (message.attachments?.length) return true;
 	if (URL_REGEX.test(message.content ?? "")) return true;
-	return false;
+	return false; */
+	return true; // Fuck discord
 }
 
 export async function handleMemes(
